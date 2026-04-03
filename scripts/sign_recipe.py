@@ -232,6 +232,68 @@ def compute_hashes(png_path):
         return None, None, True
 
 # ---------------------------------------------------------------------------
+# Crop detection
+# ---------------------------------------------------------------------------
+
+CROP_THRESHOLD = 8  # pixels - less than this on all sides = full frame
+
+
+def detect_crop(source_path, duration, native_w, native_h):
+    """
+    Use ffmpeg cropdetect to check if the author's source has black bars.
+    Samples frames from 5-85% of video, takes the mode crop value.
+    Returns dict {w, h, x, y} if bars detected, or None if full frame.
+    """
+    STABLE_FRACTION = 0.50
+
+    start = duration * 0.05
+    sample_duration = duration * 0.80
+    fps_sample = max(0.1, 300.0 / sample_duration)
+
+    cmd = [
+        "ffmpeg",
+        "-ss", "{:.3f}".format(start),
+        "-i", source_path,
+        "-t", "{:.3f}".format(sample_duration),
+        "-vf", "fps={:.4f},cropdetect=limit=24:round=2:reset=0".format(fps_sample),
+        "-an", "-f", "null", "-",
+        "-hide_banner",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    crop_counts = {}
+    for line in result.stderr.splitlines():
+        if "crop=" not in line:
+            continue
+        idx = line.rfind("crop=")
+        val = line[idx + 5:].split()[0] if line[idx + 5:].split() else ""
+        parts = val.split(":")
+        if len(parts) != 4:
+            continue
+        try:
+            w, h, x, y = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+        except ValueError:
+            continue
+        crop_counts[(w, h, x, y)] = crop_counts.get((w, h, x, y), 0) + 1
+
+    if not crop_counts:
+        return None
+
+    total = sum(crop_counts.values())
+    (w, h, x, y), count = max(crop_counts.items(), key=lambda kv: kv[1])
+
+    if count / total < STABLE_FRACTION:
+        return None
+
+    cropped_right = native_w - (x + w)
+    cropped_bottom = native_h - (y + h)
+    if x <= CROP_THRESHOLD and y <= CROP_THRESHOLD and \
+            cropped_right <= CROP_THRESHOLD and cropped_bottom <= CROP_THRESHOLD:
+        return None
+
+    return {"w": w, "h": h, "x": x, "y": y}
+
+# ---------------------------------------------------------------------------
 # Native-fps cut sequence extraction
 # ---------------------------------------------------------------------------
 
@@ -399,6 +461,19 @@ def sign_source(source, source_path, anchor_interval, work_dir):
         meta["video_codec"] or "?",
     ), flush=True)
 
+    # Detect whether the author's source is full-frame or has black bars
+    print("  Detecting crop...", flush=True)
+    crop = detect_crop(source_path, duration,
+                       meta["resolution_x"] or 0, meta["resolution_y"] or 0)
+    if crop:
+        meta["detected_crop"] = crop
+        print("  Black bars detected: content is {}x{} at offset ({},{})".format(
+            crop["w"], crop["h"], crop["x"], crop["y"]), flush=True)
+        print("  expect_full_frame will be set to FALSE for this source.", flush=True)
+    else:
+        meta["detected_crop"] = None
+        print("  No black bars detected: source appears full-frame.", flush=True)
+
     print("  Computing anchor timecodes...", flush=True)
     anchor_list = compute_anchor_timecodes(source, duration, anchor_interval)
     total = len(anchor_list)
@@ -525,6 +600,15 @@ def main():
             continue
 
         # Write back into recipe
+        # expect_full_frame: true if no black bars detected in the author's source.
+        # Viewers with pillarboxed/letterboxed files will be cropped to match.
+        # The author can override this manually if the auto-detection is wrong.
+        if "expect_full_frame" not in source:
+            source["expect_full_frame"] = meta["detected_crop"] is None
+        if meta.get("detected_crop"):
+            source.setdefault("original", {})
+            source["original"]["detected_crop"] = meta["detected_crop"]
+
         orig = source.setdefault("original", {})
         orig["sha256"] = meta["sha256"]
         orig["resolution_x"] = meta["resolution_x"]
