@@ -637,6 +637,9 @@ def cmd_sign_recipe(args):
             "python3", "/scripts/sign_recipe.py",
             "--recipe", "/work/recipe/{}".format(recipe_filename),
             "--work-dir", "/work/tmp",
+            "--seq-fraction", str(args.seq_fraction),
+            "--seq-floor", str(args.seq_floor),
+            "--seq-ceil", str(args.seq_ceil),
             "--anchor-interval", str(args.anchor_interval),
         ]
 
@@ -730,6 +733,8 @@ def cmd_match(args):
         "--output", "/work/out/{}".format(output_filename),
         "--work-dir", "/work/tmp",
         "--threshold", str(args.threshold),
+        "--search-fraction", str(args.search_fraction),
+        "--probe-frames", str(args.probe_frames),
     ]
 
     for src in slots:
@@ -1233,8 +1238,21 @@ def main():
     p_sign.add_argument("--search-dir", action="append", default=[],
                         metavar="<dir>",
                         help="Directory to search for source files by filename (repeatable)")
+    p_sign.add_argument("--seq-fraction", type=float, default=0.10,
+                        metavar="<0.0-1.0>",
+                        help="Fraction of video to capture at each end for endpoint sequences "
+                             "(default: 0.10 = first and last 10%%). Increase for short videos "
+                             "or when content near the ends is unreliable.")
+    p_sign.add_argument("--seq-floor", type=int, default=1000,
+                        metavar="<frames>",
+                        help="Minimum frames per endpoint sequence (default: 1000).")
+    p_sign.add_argument("--seq-ceil", type=int, default=10000,
+                        metavar="<frames>",
+                        help="Maximum frames per endpoint sequence (default: 10000).")
     p_sign.add_argument("--anchor-interval", type=float, default=1.0,
-                        metavar="<seconds>")
+                        metavar="<seconds>",
+                        help="Seconds between 1fps interval anchors (default: 1.0). "
+                             "Used only for Phase 4 frame-precise cut refinement, not primary matching.")
     p_sign.add_argument("--force", action="store_true",
                         help="Re-sign even if recipe is already signed")
     p_sign.set_defaults(func=cmd_sign_recipe)
@@ -1251,9 +1269,17 @@ def main():
     p_match.add_argument("--slot", action="append", default=[],
                          metavar="slot_id=/path/to/file",
                          help="Explicitly assign a file to a slot (repeatable)")
-    p_match.add_argument("--threshold", type=float, default=0.85,
+    p_match.add_argument("--threshold", type=float, default=0.65,
                          metavar="<0.0-1.0>",
-                         help="Minimum anchor match rate for a file to be suitable (default: 0.85)")
+                         help="Minimum match quality for a file to be suitable (default: 0.65). "
+                              "Based on start/end probe pHash distances.")
+    p_match.add_argument("--search-fraction", type=float, default=0.25,
+                         metavar="<0.0-1.0>",
+                         help="Fraction of viewer to search at each end (default: 0.25). "
+                              "Increase if viewer has very long pre-roll or extended credits.")
+    p_match.add_argument("--probe-frames", type=int, default=120,
+                         metavar="<frames>",
+                         help="Sliding window probe size in frames (default: 120 = ~5s at 24fps).")
     p_match.set_defaults(func=cmd_match)
 
     # cook

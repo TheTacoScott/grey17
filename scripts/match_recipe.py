@@ -31,12 +31,30 @@ import imagehash
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(
+        description="Match viewer files against a signed recipe and produce a conform plan.",
+        epilog=(
+            "Matching uses sliding window search over the first and last "
+            "--search-fraction of the viewer file to locate the author's start and end "
+            "sequences. Offset and speed are derived from those two matched timecodes."
+        ),
+    )
     p.add_argument("--recipe", required=True)
     p.add_argument("--output", required=True, help="Path to write conform plan YAML")
     p.add_argument("--slot", action="append", default=[], metavar="slot_id=/path/to/file")
     p.add_argument("--threshold", type=float, default=0.65,
-                   help="Minimum match rate to consider a file suitable (default 0.65)")
+                   metavar="<0.0-1.0>",
+                   help="Minimum match quality to consider a file suitable (default: 0.65). "
+                        "Derived from start/end probe pHash distances, not an anchor count.")
+    p.add_argument("--search-fraction", type=float, default=0.25,
+                   metavar="<0.0-1.0>",
+                   help="Fraction of viewer duration to search at each end for the matching "
+                        "region (default: 0.25 = first and last 25%%). Increase if the viewer "
+                        "has long pre-roll or extended credits.")
+    p.add_argument("--probe-frames", type=int, default=120,
+                   metavar="<frames>",
+                   help="Number of frames in the sliding window probe (default: 120 = ~5s at "
+                        "24fps). Larger values are more distinctive but slower.")
     p.add_argument("--work-dir", default="/work/tmp")
     return p.parse_args()
 
@@ -486,15 +504,10 @@ def detect_crop(viewer_path, duration, native_w, native_h):
 # Sliding window endpoint matching engine
 # ---------------------------------------------------------------------------
 
-# Search this fraction of viewer duration at each end for the matching region.
-# 25% gives generous buffer for pre-roll, bumpers, extended credits.
-VIEWER_SEARCH_FRACTION = 0.25
-
-# Number of frames in the probe window used for sliding window scoring.
-# 5 seconds at 24fps = 120 frames. Large enough to be unambiguous, small
-# enough to be fast. Skips the first second to avoid fade-in black frames.
-PROBE_FRAMES = 120
-PROBE_SKIP_FRAMES = 24  # skip this many frames at the start of each sequence
+# Defaults - overridden by CLI args threaded through to endpoint_match()
+VIEWER_SEARCH_FRACTION_DEFAULT = 0.25
+PROBE_FRAMES_DEFAULT = 120
+PROBE_SKIP_FRAMES = 24  # skip first ~1s to avoid fade-in black; not user-configurable
 
 
 def extract_viewer_endpoint_frames(viewer_path, start_tc, duration_secs, fps, seq_dir):
@@ -563,7 +576,9 @@ def sliding_window_search(probe_hashes, search_hashes, fps):
     return best_pos, best_score
 
 
-def endpoint_match(source, viewer_path, viewer_duration, work_dir):
+def endpoint_match(source, viewer_path, viewer_duration, work_dir,
+                   search_fraction=VIEWER_SEARCH_FRACTION_DEFAULT,
+                   probe_frames=PROBE_FRAMES_DEFAULT):
     """
     Find where the author's start and end sequences appear in the viewer file.
 
@@ -595,18 +610,18 @@ def endpoint_match(source, viewer_path, viewer_duration, work_dir):
     end_phashes = end_seq["phashes"]
 
     skip = min(PROBE_SKIP_FRAMES, len(start_phashes) // 4)
-    start_probe = start_phashes[skip: skip + PROBE_FRAMES]
-    end_probe = end_phashes[-(PROBE_FRAMES + skip): len(end_phashes) - skip]
+    start_probe = start_phashes[skip: skip + probe_frames]
+    end_probe = end_phashes[-(probe_frames + skip): len(end_phashes) - skip]
     if not end_probe:
-        end_probe = end_phashes[-PROBE_FRAMES:]
+        end_probe = end_phashes[-probe_frames:]
 
     author_start_tc = start_seq["start_tc"] + skip / recipe_fps
-    author_end_tc = end_seq["start_tc"] + (len(end_phashes) - skip - PROBE_FRAMES) / recipe_fps
+    author_end_tc = end_seq["start_tc"] + (len(end_phashes) - skip - probe_frames) / recipe_fps
 
     # Search region sizes
-    search_duration = viewer_duration * VIEWER_SEARCH_FRACTION
+    search_duration = viewer_duration * search_fraction
 
-    # -- Start search: first VIEWER_SEARCH_FRACTION of viewer --
+    # -- Start search: first search_fraction of viewer --
     print("  Extracting viewer start search region ({:.0f}s)...".format(
         search_duration), flush=True)
     start_search_hashes = extract_viewer_endpoint_frames(
@@ -624,7 +639,7 @@ def endpoint_match(source, viewer_path, viewer_duration, work_dir):
     print("  Start match: viewer_tc={:.3f}s  mean_dist={:.2f}".format(
         viewer_start_tc, start_score), flush=True)
 
-    # -- End search: last VIEWER_SEARCH_FRACTION of viewer --
+    # -- End search: last search_fraction of viewer --
     end_search_start = max(0.0, viewer_duration - search_duration)
     print("  Extracting viewer end search region ({:.0f}s from {:.0f}s)...".format(
         search_duration, end_search_start), flush=True)
@@ -1116,7 +1131,9 @@ def compute_trim_points(source, offset, speed_factor, viewer_duration):
 # Main match loop
 # ---------------------------------------------------------------------------
 
-def match_slot(source, viewer_path, viewer_info, work_dir, threshold):
+def match_slot(source, viewer_path, viewer_info, work_dir, threshold,
+               search_fraction=VIEWER_SEARCH_FRACTION_DEFAULT,
+               probe_frames=PROBE_FRAMES_DEFAULT):
     """
     Match a single viewer file against a recipe source slot.
     Returns a result dict for inclusion in the conform plan.
@@ -1160,7 +1177,9 @@ def match_slot(source, viewer_path, viewer_info, work_dir, threshold):
 
     if source.get("start_sequence") and source.get("end_sequence"):
         # Endpoint sliding window path (primary)
-        ep = endpoint_match(source, viewer_path, viewer_duration, work_dir)
+        ep = endpoint_match(source, viewer_path, viewer_duration, work_dir,
+                            search_fraction=search_fraction,
+                            probe_frames=probe_frames)
         if ep is None:
             print("  ERROR: endpoint match failed", file=sys.stderr)
             return {"slot_id": slot_id, "status": "no_match", "match_rate": 0.0}
@@ -1327,7 +1346,9 @@ def main():
                 viewer_info["video_codec"] or "?",
             ), flush=True)
 
-            result = match_slot(source, viewer_path, viewer_info, work_dir, args.threshold)
+            result = match_slot(source, viewer_path, viewer_info, work_dir, args.threshold,
+                                search_fraction=args.search_fraction,
+                                probe_frames=args.probe_frames)
             if result:
                 results.append(result)
                 if result["status"] != "suitable":

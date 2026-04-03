@@ -27,13 +27,36 @@ from PIL import Image
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(
+        description="Fingerprint source videos and write anchor data into a recipe.",
+        epilog=(
+            "Primary matching data: start-sequence and end-sequence, captured at native fps "
+            "for the first and last --seq-fraction of each source. These are used by "
+            "'grey17 match' for sliding window endpoint alignment.\n\n"
+            "Secondary data: 1fps interval anchors throughout the video, used only for "
+            "Phase 4 frame-precise cut-point refinement after the endpoint match."
+        ),
+    )
     p.add_argument("--recipe", required=True, help="Path to recipe.yaml (read/write)")
     p.add_argument("--work-dir", default="/work/tmp", help="Writable scratch directory")
     p.add_argument("--source", action="append", default=[], metavar="slot_id=/path/to/file",
                    help="Map a source slot to a file (repeatable)")
+    # Endpoint sequence parameters (primary matching data)
+    p.add_argument("--seq-fraction", type=float, default=0.10,
+                   metavar="<0.0-1.0>",
+                   help="Fraction of video to capture at each end for endpoint sequences "
+                        "(default: 0.10 = first and last 10%%).")
+    p.add_argument("--seq-floor", type=int, default=1000,
+                   metavar="<frames>",
+                   help="Minimum frames per endpoint sequence (default: 1000).")
+    p.add_argument("--seq-ceil", type=int, default=10000,
+                   metavar="<frames>",
+                   help="Maximum frames per endpoint sequence (default: 10000).")
+    # Interval anchor parameters (secondary - for Phase 4 cut refinement only)
     p.add_argument("--anchor-interval", type=float, default=1.0,
-                   help="Seconds between interval anchors (default: 1.0)")
+                   metavar="<seconds>",
+                   help="Seconds between 1fps interval anchors used for Phase 4 cut-point "
+                        "refinement. Not used for primary matching (default: 1.0).")
     return p.parse_args()
 
 
@@ -201,10 +224,10 @@ def extract_frames_batch(source_path, timecodes_1s, frames_dir):
     return mapping
 
 
-# Start/end sequence parameters
-SEQ_FRACTION = 0.10   # capture first/last 10% of video duration
-SEQ_FLOOR    = 1000   # minimum frames per sequence
-SEQ_CEIL     = 10000  # maximum frames per sequence
+# Start/end sequence parameter defaults (overridable via CLI)
+SEQ_FRACTION_DEFAULT = 0.10
+SEQ_FLOOR_DEFAULT    = 1000
+SEQ_CEIL_DEFAULT     = 10000
 
 
 def extract_endpoint_sequence(source_path, fps, start_tc, duration_secs, seq_dir):
@@ -245,14 +268,17 @@ def extract_endpoint_sequence(source_path, fps, start_tc, duration_secs, seq_dir
     return {"start_tc": round(start_tc, 6), "fps": round(fps, 6), "phashes": phashes}
 
 
-def compute_sequence_window(duration_seconds, native_fps):
+def compute_sequence_window(duration_seconds, native_fps,
+                            seq_fraction=SEQ_FRACTION_DEFAULT,
+                            seq_floor=SEQ_FLOOR_DEFAULT,
+                            seq_ceil=SEQ_CEIL_DEFAULT):
     """
     Compute how many seconds to capture for a start/end sequence, and the
-    resulting frame count. Respects SEQ_FLOOR and SEQ_CEIL.
+    resulting frame count. Respects seq_floor and seq_ceil.
     Returns (window_seconds, frame_count).
     """
-    target_frames = int(duration_seconds * SEQ_FRACTION * native_fps)
-    target_frames = max(SEQ_FLOOR, min(SEQ_CEIL, target_frames))
+    target_frames = int(duration_seconds * seq_fraction * native_fps)
+    target_frames = max(seq_floor, min(seq_ceil, target_frames))
     window_seconds = target_frames / native_fps
     return window_seconds, target_frames
 
@@ -492,7 +518,10 @@ def fingerprint_at_offset(source_path, timecode):
 # Per-source signing
 # ---------------------------------------------------------------------------
 
-def sign_source(source, source_path, anchor_interval, work_dir):
+def sign_source(source, source_path, anchor_interval, work_dir,
+                seq_fraction=SEQ_FRACTION_DEFAULT,
+                seq_floor=SEQ_FLOOR_DEFAULT,
+                seq_ceil=SEQ_CEIL_DEFAULT):
     """
     Sign a single source file. Returns (source_metadata, anchors_list).
     source: the source dict from the recipe.
@@ -550,7 +579,8 @@ def sign_source(source, source_path, anchor_interval, work_dir):
 
     # --- Start/end endpoint sequences at native fps for sliding window matching ---
     native_fps = meta.get("fps") or 24.0
-    window_secs, n_frames = compute_sequence_window(duration, native_fps)
+    window_secs, n_frames = compute_sequence_window(duration, native_fps,
+                                                     seq_fraction, seq_floor, seq_ceil)
 
     print("  Extracting start sequence ({} frames, {:.1f}s at {:.3f}fps)...".format(
         n_frames, window_secs, native_fps), flush=True)
@@ -670,6 +700,9 @@ def main():
             meta, anchors, start_seq, end_seq = sign_source(
                 source, source_path,
                 args.anchor_interval, work_dir,
+                seq_fraction=args.seq_fraction,
+                seq_floor=args.seq_floor,
+                seq_ceil=args.seq_ceil,
             )
         except Exception as e:
             print("ERROR signing {}: {}".format(slot_id, e), file=sys.stderr)
