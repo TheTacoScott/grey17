@@ -1,6 +1,7 @@
 CLAUDE.md
 .claude/
 docs/
+plan/
 .idea/
 tmp/
 __pycache__/
