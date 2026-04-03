@@ -3,3 +3,4 @@ CLAUDE.md
 docs/
 .idea/
 tmp/
+__pycache__/
