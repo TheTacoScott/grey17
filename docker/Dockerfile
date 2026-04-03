@@ -10,6 +10,10 @@ ENV PATH="${BLENDER_PATH}:${PATH}"
 RUN apt-get update && apt-get install -y \
     wget \
     xz-utils \
+    python3-pip \
+    ffmpeg \
+    libchromaprint-tools \
+    libchromaprint1 \
     libxrender1 \
     libxxf86vm1 \
     libxfixes3 \
@@ -22,6 +26,12 @@ RUN apt-get update && apt-get install -y \
     libfontconfig1 \
     libopenexr-dev \
     && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir \
+    ImageHash \
+    Pillow \
+    chromaprint \
+    pyyaml
 
 RUN wget -q \
     https://mirror.clarkson.edu/blender/release/Blender2.91/blender-2.91.0-linux64.tar.xz \

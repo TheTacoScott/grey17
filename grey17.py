@@ -179,6 +179,26 @@ def manifest_to_recipe(manifest, blend_path, title, author, blend_dir_host=None)
             return os.path.join(blend_dir_host, rel)
         return container_path
 
+    fps = scene["fps"] / scene["fps_base"]
+
+    def strip_timecodes_for_source(source_id):
+        """Compute strip in/out timecodes for a source from the manifest."""
+        seen = {}
+        for strip in manifest.get("strips", []):
+            if strip.get("source_id") != source_id:
+                continue
+            if strip["type"] not in ("MOVIE", "SOUND"):
+                continue
+            in_frame = strip["frame_offset_start"]
+            dur_frames = strip["frame_final_duration"]
+            out_frame = in_frame + dur_frames
+            in_tc = round(in_frame / fps, 6)
+            out_tc = round(out_frame / fps, 6)
+            for tc, role in [(in_tc, "strip_in"), (out_tc, "strip_out")]:
+                if tc not in seen:
+                    seen[tc] = {"timecode": tc, "role": role, "strip": strip["name"]}
+        return sorted(seen.values(), key=lambda x: x["timecode"])
+
     sources = []
     for src in manifest["sources"]:
         sources.append({
@@ -205,6 +225,8 @@ def manifest_to_recipe(manifest, blend_path, title, author, blend_dir_host=None)
             },
             # anchors populated by sign-recipe
             "anchors": [],
+            # strip in/out timecodes - used by sign-recipe to place critical anchors
+            "strip_timecodes": strip_timecodes_for_source(src["id"]),
         })
 
     recipe = {
@@ -417,6 +439,220 @@ def cmd_inspect(args):
         print(json.dumps(data, indent=2))
 
 # ---------------------------------------------------------------------------
+# Recipe reader (stdlib only - no PyYAML on host)
+# ---------------------------------------------------------------------------
+
+def parse_recipe_minimal(recipe_path):
+    """
+    Extract just what the wrapper needs from a recipe.yaml without a full
+    YAML parser. Only reliable for YAML written by grey17 generate-recipe.
+
+    Returns dict with keys:
+      signed: bool
+      sources: list of {id, filename, filepath_on_author_machine}
+    """
+    result = {"signed": False, "sources": []}
+    current_source = None
+    in_sources = False
+    in_original = False
+    indent_sources = None
+
+    with open(recipe_path) as f:
+        for raw_line in f:
+            line = raw_line.rstrip()
+            stripped = line.lstrip()
+            indent = len(line) - len(stripped)
+
+            if not stripped:
+                continue
+
+            # Top-level signed flag
+            if line.startswith("signed:"):
+                val = line.split(":", 1)[1].strip().lower()
+                result["signed"] = val == "true"
+                continue
+
+            # Detect sources: block start
+            if line == "sources:":
+                in_sources = True
+                indent_sources = 0
+                continue
+
+            # Detect end of sources block (top-level key at same or less indent)
+            if in_sources and indent <= (indent_sources or 0) and stripped and not stripped.startswith("-") and ":" in stripped:
+                if indent == 0 and not line.startswith(" "):
+                    in_sources = False
+                    in_original = False
+                    current_source = None
+                    continue
+
+            if not in_sources:
+                continue
+
+            # New source entry: "  - id: source_N"
+            if stripped.startswith("- id:"):
+                if current_source:
+                    result["sources"].append(current_source)
+                slot_id = stripped.split(":", 1)[1].strip()
+                current_source = {"id": slot_id, "filename": None, "filepath_on_author_machine": None}
+                in_original = False
+                continue
+
+            if current_source is None:
+                continue
+
+            # Enter original: block
+            if stripped == "original:":
+                in_original = True
+                continue
+
+            if in_original:
+                if stripped.startswith("filename:"):
+                    val = stripped.split(":", 1)[1].strip().strip('"')
+                    current_source["filename"] = val
+                elif stripped.startswith("filepath_on_author_machine:"):
+                    val = stripped.split(":", 1)[1].strip().strip('"')
+                    current_source["filepath_on_author_machine"] = val
+                # Exit original block when we hit a key at lower indent level
+                elif indent <= 4 and stripped and ":" in stripped and not stripped.startswith("#"):
+                    in_original = False
+
+    if current_source:
+        result["sources"].append(current_source)
+
+    return result
+
+
+def resolve_source_paths(sources, explicit_sources, search_dirs):
+    """
+    For each source slot, resolve the actual file path to use.
+
+    explicit_sources: dict of {slot_id: path} from --source args
+    search_dirs: list of directory paths from --search-dir args
+
+    Returns dict of {slot_id: resolved_path} for slots that were found.
+    Missing slots are omitted.
+    """
+    resolved = {}
+    for src in sources:
+        slot_id = src["id"]
+        filename = src.get("filename")
+
+        # 1. Explicit --source mapping
+        if slot_id in explicit_sources:
+            path = explicit_sources[slot_id]
+            if os.path.exists(path):
+                resolved[slot_id] = path
+            else:
+                print("WARNING: explicit path not found for {}: {}".format(slot_id, path))
+            continue
+
+        # 2. Search directories by filename
+        if filename and search_dirs:
+            for d in search_dirs:
+                candidate = os.path.join(d, filename)
+                if os.path.exists(candidate):
+                    resolved[slot_id] = candidate
+                    break
+
+        if slot_id in resolved:
+            continue
+
+        # 3. Original path from recipe
+        orig_path = src.get("filepath_on_author_machine")
+        if orig_path and os.path.exists(orig_path):
+            resolved[slot_id] = orig_path
+
+    return resolved
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_sign_recipe(args):
+    recipe_path = os.path.abspath(args.recipe)
+    if not os.path.exists(recipe_path):
+        die("Recipe file not found: {}".format(recipe_path))
+
+    recipe_meta = parse_recipe_minimal(recipe_path)
+
+    if recipe_meta["signed"] and not args.force:
+        die("Recipe is already signed. Use --force to re-sign.")
+
+    if not recipe_meta["sources"]:
+        die("No sources found in recipe.")
+
+    # Resolve source file paths
+    explicit = {}
+    for s in args.source:
+        if "=" not in s:
+            die("Invalid --source format (expected slot_id=/path): {}".format(s))
+        slot_id, path = s.split("=", 1)
+        explicit[slot_id.strip()] = os.path.abspath(path.strip())
+
+    search_dirs = [os.path.abspath(d) for d in (args.search_dir or [])]
+
+    resolved = resolve_source_paths(recipe_meta["sources"], explicit, search_dirs)
+
+    # Report resolution
+    print("\nSource file resolution:")
+    all_found = True
+    for src in recipe_meta["sources"]:
+        slot_id = src["id"]
+        path = resolved.get(slot_id)
+        if path:
+            print("  {} -> {}".format(slot_id, path))
+        else:
+            print("  {} -> NOT FOUND (filename: {})".format(slot_id, src.get("filename")))
+            all_found = False
+
+    if not all_found:
+        print("")
+        print("Some sources could not be resolved. Provide paths via:")
+        print("  --source slot_id=/path/to/file")
+        print("  --search-dir /directory/containing/files")
+        die("Cannot sign recipe with missing sources.")
+
+    ensure_image()
+
+    recipe_dir = os.path.dirname(recipe_path)
+    recipe_filename = os.path.basename(recipe_path)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Build mounts: recipe dir (rw) + each source file (ro) + tmp work dir (rw)
+        mounts = [
+            (recipe_dir, "/work/recipe", "rw"),
+            (tmpdir, "/work/tmp", "rw"),
+            (SCRIPTS_DIR, "/scripts", "ro"),
+        ]
+
+        sign_cmd = [
+            "python3", "/scripts/sign_recipe.py",
+            "--recipe", "/work/recipe/{}".format(recipe_filename),
+            "--work-dir", "/work/tmp",
+            "--anchor-interval", str(args.anchor_interval),
+        ]
+
+        # Mount each source and add --source arg
+        for src in recipe_meta["sources"]:
+            slot_id = src["id"]
+            path = resolved[slot_id]
+            filename = src.get("filename") or os.path.basename(path)
+            container_path = "/work/sources/{}/{}".format(slot_id, filename)
+            mounts.append((path, container_path, "ro"))
+            sign_cmd += ["--source", "{}={}".format(slot_id, container_path)]
+
+        print("\nSigning recipe: {}".format(recipe_filename))
+        result = run_docker(DOCKER_IMAGE, mounts, sign_cmd)
+
+        if result.returncode != 0:
+            die("sign-recipe failed (exit {})".format(result.returncode))
+
+    print("\nDone. Recipe is signed and ready to share.")
+
+
+# ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
 
@@ -451,6 +687,24 @@ def main():
     p_gen.add_argument("--title", default="", metavar="<title>")
     p_gen.add_argument("--author", default="", metavar="<handle>")
     p_gen.set_defaults(func=cmd_generate_recipe)
+
+    # sign-recipe
+    p_sign = sub.add_parser(
+        "sign-recipe",
+        help="Fingerprint source videos and write anchor points into a recipe",
+    )
+    p_sign.add_argument("recipe", metavar="<recipe.yaml>")
+    p_sign.add_argument("--source", action="append", default=[],
+                        metavar="slot_id=/path/to/file",
+                        help="Explicitly map a source slot to a file (repeatable)")
+    p_sign.add_argument("--search-dir", action="append", default=[],
+                        metavar="<dir>",
+                        help="Directory to search for source files by filename (repeatable)")
+    p_sign.add_argument("--anchor-interval", type=float, default=1.0,
+                        metavar="<seconds>")
+    p_sign.add_argument("--force", action="store_true",
+                        help="Re-sign even if recipe is already signed")
+    p_sign.set_defaults(func=cmd_sign_recipe)
 
     # inspect (debug)
     p_inspect = sub.add_parser(
