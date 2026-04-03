@@ -652,6 +652,104 @@ def cmd_sign_recipe(args):
     print("\nDone. Recipe is signed and ready to share.")
 
 
+def cmd_match(args):
+    recipe_path = os.path.abspath(args.recipe)
+    output_path = os.path.abspath(args.output_conform_plan)
+
+    if not os.path.exists(recipe_path):
+        die("Recipe file not found: {}".format(recipe_path))
+
+    if not args.files and not args.slot:
+        die("Provide at least one candidate file or --slot mapping.")
+
+    recipe_meta = parse_recipe_minimal(recipe_path)
+
+    if not recipe_meta.get("signed"):
+        die("Recipe has not been signed yet. Run sign-recipe first.")
+
+    # Build slot -> file mapping
+    # 1. Explicit --slot args take priority
+    explicit = {}
+    for s in (args.slot or []):
+        if "=" not in s:
+            die("Invalid --slot format (expected slot_id=/path): {}".format(s))
+        slot_id, path = s.split("=", 1)
+        explicit[slot_id.strip()] = os.path.abspath(path.strip())
+
+    # 2. Auto-assign positional files to slots by order
+    candidate_files = [os.path.abspath(f) for f in (args.files or [])]
+    slots = recipe_meta.get("sources", [])
+
+    slot_file_map = {}
+    auto_idx = 0
+    for src in slots:
+        sid = src["id"]
+        if sid in explicit:
+            slot_file_map[sid] = explicit[sid]
+        elif auto_idx < len(candidate_files):
+            slot_file_map[sid] = candidate_files[auto_idx]
+            auto_idx += 1
+
+    if not slot_file_map:
+        die("Could not assign any files to source slots.")
+
+    # Validate files exist
+    for sid, path in slot_file_map.items():
+        if not os.path.exists(path):
+            die("File not found for {}: {}".format(sid, path))
+
+    ensure_image()
+
+    recipe_dir = os.path.dirname(recipe_path)
+    recipe_filename = os.path.basename(recipe_path)
+    output_dir = os.path.dirname(output_path)
+    output_filename = os.path.basename(output_path)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Use a work dir under tmp/ - avoids permission issues with Docker-created root files
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    work_dir = os.path.join(project_root, "tmp", "_match_work")
+    os.makedirs(work_dir, exist_ok=True)
+
+    mounts = [
+        (recipe_dir, "/work/recipe", "ro"),
+        (work_dir, "/work/tmp", "rw"),
+        (output_dir, "/work/out", "rw"),
+        (SCRIPTS_DIR, "/scripts", "ro"),
+    ]
+
+    match_cmd = [
+        "python3", "/scripts/match_recipe.py",
+        "--recipe", "/work/recipe/{}".format(recipe_filename),
+        "--output", "/work/out/{}".format(output_filename),
+        "--work-dir", "/work/tmp",
+        "--threshold", str(args.threshold),
+    ]
+
+    for src in slots:
+        sid = src["id"]
+        if sid not in slot_file_map:
+            continue
+        host_file = slot_file_map[sid]
+        filename = os.path.basename(host_file)
+        container_path = "/work/candidates/{}/{}".format(sid, filename)
+        mounts.append((host_file, container_path, "ro"))
+        match_cmd += ["--slot", "{}={}".format(sid, container_path)]
+
+    print("Running match...")
+    print("  Recipe: {}".format(recipe_filename))
+    for sid, path in slot_file_map.items():
+        print("  {}: {}".format(sid, os.path.basename(path)))
+    print()
+
+    result = run_docker(DOCKER_IMAGE, mounts, match_cmd)
+
+    if result.returncode != 0:
+        die("match failed (exit {})".format(result.returncode))
+
+    print("Conform plan written to: {}".format(output_path))
+
+
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
@@ -705,6 +803,23 @@ def main():
     p_sign.add_argument("--force", action="store_true",
                         help="Re-sign even if recipe is already signed")
     p_sign.set_defaults(func=cmd_sign_recipe)
+
+    # match
+    p_match = sub.add_parser(
+        "match",
+        help="Match viewer files against a signed recipe and produce a conform plan",
+    )
+    p_match.add_argument("recipe", metavar="<recipe.yaml>")
+    p_match.add_argument("output_conform_plan", metavar="<output.conform.yaml>")
+    p_match.add_argument("files", nargs="*", metavar="<file>",
+                         help="Candidate video files (auto-assigned to slots in order)")
+    p_match.add_argument("--slot", action="append", default=[],
+                         metavar="slot_id=/path/to/file",
+                         help="Explicitly assign a file to a slot (repeatable)")
+    p_match.add_argument("--threshold", type=float, default=0.85,
+                         metavar="<0.0-1.0>",
+                         help="Minimum anchor match rate for a file to be suitable (default: 0.85)")
+    p_match.set_defaults(func=cmd_match)
 
     # inspect (debug)
     p_inspect = sub.add_parser(
