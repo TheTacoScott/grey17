@@ -11,6 +11,7 @@ Usage:
         --anchor-interval 1.0
 """
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -46,6 +47,18 @@ def parse_source_args(source_args):
         slot_id, path = s.split("=", 1)
         mapping[slot_id.strip()] = path.strip()
     return mapping
+
+# ---------------------------------------------------------------------------
+# SHA256
+# ---------------------------------------------------------------------------
+
+def compute_sha256(path):
+    """Compute SHA256 hex digest of a file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 # ---------------------------------------------------------------------------
 # ffprobe
@@ -219,6 +232,62 @@ def compute_hashes(png_path):
         return None, None, True
 
 # ---------------------------------------------------------------------------
+# Native-fps cut sequence extraction
+# ---------------------------------------------------------------------------
+
+CUT_SEQUENCE_WINDOW = 2.0  # seconds on each side of the cut point
+
+
+def extract_cut_sequence(source_path, cut_tc, fps, seq_dir):
+    """
+    Extract frames at native fps for a window of +/- CUT_SEQUENCE_WINDOW seconds
+    around cut_tc. Compute pHash for each frame.
+    Returns dict with window_start_tc, fps, phashes, reliable - or None on failure.
+    """
+    start = max(0.0, cut_tc - CUT_SEQUENCE_WINDOW)
+    duration = CUT_SEQUENCE_WINDOW * 2.0
+
+    os.makedirs(seq_dir, exist_ok=True)
+    cmd = [
+        "ffmpeg",
+        "-ss", str(start),
+        "-i", source_path,
+        "-t", str(duration),
+        "-vf", "scale=32:32:flags=lanczos,format=gray",
+        "-vsync", "cfr",
+        "-r", str(round(fps, 6)),
+        "-f", "image2",
+        os.path.join(seq_dir, "frame_%06d.png"),
+        "-hide_banner", "-loglevel", "error",
+        "-y",
+    ]
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        return None
+
+    phashes = []
+    low_entropy_count = 0
+    for fname in sorted(os.listdir(seq_dir)):
+        if not fname.startswith("frame_") or not fname.endswith(".png"):
+            continue
+        ph, _ah, low_entropy = compute_hashes(os.path.join(seq_dir, fname))
+        phashes.append(ph if ph else "0" * 16)
+        if low_entropy:
+            low_entropy_count += 1
+
+    if not phashes:
+        return None
+
+    reliable = (low_entropy_count / len(phashes)) < 0.5
+
+    return {
+        "window_start_tc": round(start, 6),
+        "fps": round(fps, 6),
+        "phashes": phashes,
+        "reliable": reliable,
+    }
+
+# ---------------------------------------------------------------------------
 # Audio fingerprinting via fpcalc
 # ---------------------------------------------------------------------------
 
@@ -312,8 +381,13 @@ def sign_source(source, source_path, anchor_interval, work_dir):
     """
     source_id = source["id"]
 
+    print("  Computing SHA256...", flush=True)
+    sha256 = compute_sha256(source_path)
+    print("  SHA256: {}".format(sha256), flush=True)
+
     print("  Running ffprobe...", flush=True)
     meta = ffprobe_source(source_path)
+    meta["sha256"] = sha256
     duration = meta["duration_seconds"]
     if not duration:
         raise RuntimeError("Could not determine duration for {}".format(source_path))
@@ -397,6 +471,23 @@ def sign_source(source, source_path, anchor_interval, work_dir):
             print("  [{}/{}] ({} video seeks, {} audio seeks)".format(
                 i + 1, total, seek_count, fpcalc_seek_count), flush=True)
 
+    # Extract native-fps cut sequences for strip_in/strip_out anchors
+    native_fps = meta.get("fps") or 24.0
+    cut_anchors = [a for a in anchors if a["role"] in ("strip_in", "strip_out")]
+    if cut_anchors:
+        print("  Extracting cut sequences for {} cut anchors (fps={:.3f})...".format(
+            len(cut_anchors), native_fps), flush=True)
+        cut_seq_base = os.path.join(work_dir, "{}_cut_seqs".format(source_id))
+        for anchor in cut_anchors:
+            tc = anchor["timecode"]
+            seq_dir = os.path.join(cut_seq_base, "tc_{:.6f}".format(tc).replace(".", "_"))
+            cut_seq = extract_cut_sequence(source_path, tc, native_fps, seq_dir)
+            if cut_seq:
+                anchor["cut_sequence"] = cut_seq
+            shutil.rmtree(seq_dir, ignore_errors=True)
+        n_seq = sum(1 for a in cut_anchors if "cut_sequence" in a)
+        print("  Cut sequences extracted: {}".format(n_seq), flush=True)
+
     return meta, anchors
 
 # ---------------------------------------------------------------------------
@@ -435,6 +526,7 @@ def main():
 
         # Write back into recipe
         orig = source.setdefault("original", {})
+        orig["sha256"] = meta["sha256"]
         orig["resolution_x"] = meta["resolution_x"]
         orig["resolution_y"] = meta["resolution_y"]
         orig["fps"] = meta["fps"]

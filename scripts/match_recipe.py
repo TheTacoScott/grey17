@@ -13,12 +13,13 @@ Usage:
 """
 import argparse
 import base64
+import hashlib
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
-import tempfile
 import datetime
 
 import yaml
@@ -87,6 +88,18 @@ def ffprobe_source(path):
         info["duration_seconds"] = float(fmt["duration"])
 
     return info
+
+# ---------------------------------------------------------------------------
+# SHA256
+# ---------------------------------------------------------------------------
+
+def compute_sha256(path):
+    """Compute SHA256 hex digest of a file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 # ---------------------------------------------------------------------------
 # Fingerprint comparison
@@ -232,6 +245,164 @@ def fingerprint_viewer_video(viewer_path, duration_seconds, frames_dir):
 
     print("  Video frames: {}".format(len(video_map)), flush=True)
     return video_map
+
+# ---------------------------------------------------------------------------
+# Phase 4: fine-pass frame alignment using cut sequences
+# ---------------------------------------------------------------------------
+
+def extract_frames_native_fps(viewer_path, start_tc, duration, fps, seq_dir):
+    """
+    Extract frames at the given fps for a window starting at start_tc.
+    Returns list of pHash strings (one per frame).
+    """
+    os.makedirs(seq_dir, exist_ok=True)
+    cmd = [
+        "ffmpeg",
+        "-ss", str(max(0.0, start_tc)),
+        "-i", viewer_path,
+        "-t", str(duration),
+        "-vf", "scale=32:32:flags=lanczos,format=gray",
+        "-vsync", "cfr",
+        "-r", str(round(fps, 6)),
+        "-f", "image2",
+        os.path.join(seq_dir, "frame_%06d.png"),
+        "-hide_banner", "-loglevel", "error", "-y",
+    ]
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        return []
+    phashes = []
+    for fname in sorted(os.listdir(seq_dir)):
+        if not fname.startswith("frame_") or not fname.endswith(".png"):
+            continue
+        try:
+            img = Image.open(os.path.join(seq_dir, fname)).convert("L")
+            phashes.append(str(imagehash.phash(img)))
+        except Exception:
+            phashes.append("0" * 16)
+    return phashes
+
+
+def sliding_window_best(recipe_phashes, viewer_phashes):
+    """
+    Slide recipe_phashes over viewer_phashes, return (best_pos, avg_dist).
+    best_pos is the index into viewer_phashes where recipe_phashes[0] aligns best.
+    avg_dist is average pHash Hamming distance at that alignment.
+    """
+    rn = len(recipe_phashes)
+    vn = len(viewer_phashes)
+    if rn == 0 or vn < rn:
+        return None, float("inf")
+    best_pos = 0
+    best_dist = float("inf")
+    for pos in range(vn - rn + 1):
+        dist = sum(phash_distance(recipe_phashes[i], viewer_phashes[pos + i])
+                   for i in range(rn))
+        avg = dist / rn
+        if avg < best_dist:
+            best_dist = avg
+            best_pos = pos
+    return best_pos, best_dist
+
+
+def phase4_fine_pass(recipe_anchors, viewer_path, rough_offset, rough_speed, work_dir):
+    """
+    Phase 4: frame-precise alignment using cut_sequence sliding window.
+
+    For each cut anchor with a reliable cut_sequence:
+    - Predict viewer timecode using rough_offset/rough_speed
+    - Extract viewer frames at recipe native fps for a +/-4s window
+    - Slide recipe cut_sequence.phashes over viewer frames to find frame-precise alignment
+    - Collect (recipe_tc, precise_viewer_tc) pairs
+    - Linear regression to get final (offset, speed_factor)
+
+    Returns (offset, speed_factor), unchanged if insufficient data.
+    """
+    print("  Phase 4: fine-pass frame alignment...", flush=True)
+    VIEWER_WINDOW = 4.0  # seconds on each side of predicted viewer position
+    MAX_AVG_DIST = 15.0  # reject alignment if avg pHash distance exceeds this
+
+    cut_anchors = [
+        a for a in recipe_anchors
+        if a.get("role") in ("strip_in", "strip_out")
+        and isinstance(a.get("cut_sequence"), dict)
+        and a["cut_sequence"].get("reliable", True)
+        and a["cut_sequence"].get("phashes")
+    ]
+
+    if not cut_anchors:
+        print("  Phase 4: no cut sequences available, skipping.", flush=True)
+        return rough_offset, rough_speed
+
+    print("  Phase 4: {} cut anchors with sequences".format(len(cut_anchors)), flush=True)
+
+    pairs = []  # (recipe_tc, viewer_tc_precise)
+    seq_base = os.path.join(work_dir, "fine_pass")
+
+    for i, anchor in enumerate(cut_anchors):
+        recipe_tc = anchor["timecode"]
+        cut_seq = anchor["cut_sequence"]
+        recipe_fps = cut_seq["fps"]
+        recipe_phashes = cut_seq["phashes"]
+        window_start = cut_seq["window_start_tc"]
+
+        predicted_viewer_tc = recipe_tc * rough_speed + rough_offset
+        viewer_start = max(0.0, predicted_viewer_tc - VIEWER_WINDOW)
+        viewer_duration = VIEWER_WINDOW * 2.0
+
+        seq_dir = os.path.join(seq_base, "anchor_{:04d}".format(i))
+        viewer_phashes = extract_frames_native_fps(
+            viewer_path, viewer_start, viewer_duration, recipe_fps, seq_dir)
+        shutil.rmtree(seq_dir, ignore_errors=True)
+
+        if len(viewer_phashes) < len(recipe_phashes):
+            continue
+
+        best_pos, avg_dist = sliding_window_best(recipe_phashes, viewer_phashes)
+        if best_pos is None or avg_dist > MAX_AVG_DIST:
+            continue
+
+        # viewer_phashes[0] corresponds to viewer_start.
+        # recipe_phashes[0] corresponds to window_start (which is recipe_tc - window).
+        # best_pos tells us where recipe frame 0 aligns in the viewer frame list.
+        # Viewer tc for recipe_phashes[0]: viewer_start + best_pos / recipe_fps
+        # The cut point (recipe_tc) is (recipe_tc - window_start) seconds into the recipe sequence.
+        frames_to_cut = (recipe_tc - window_start) * recipe_fps
+        precise_viewer_cut_tc = viewer_start + (best_pos + frames_to_cut) / recipe_fps
+
+        pairs.append((recipe_tc, precise_viewer_cut_tc))
+        print("  anchor {:.3f}s -> viewer {:.6f}s  (avg dist {:.1f})".format(
+            recipe_tc, precise_viewer_cut_tc, avg_dist), flush=True)
+
+    shutil.rmtree(seq_base, ignore_errors=True)
+
+    if len(pairs) < 2:
+        print("  Phase 4: only {} pairs, need >=2. Keeping Phase 3 result.".format(
+            len(pairs)), flush=True)
+        return rough_offset, rough_speed
+
+    # Linear regression: viewer_tc = recipe_tc * speed_factor + offset
+    n = len(pairs)
+    xs = [p[0] for p in pairs]
+    ys = [p[1] for p in pairs]
+    sum_x = sum(xs)
+    sum_y = sum(ys)
+    sum_xx = sum(x * x for x in xs)
+    sum_xy = sum(x * y for x, y in zip(xs, ys))
+
+    denom = n * sum_xx - sum_x * sum_x
+    if abs(denom) < 1e-9:
+        print("  Phase 4: degenerate regression, keeping Phase 3 result.", flush=True)
+        return rough_offset, rough_speed
+
+    speed_factor = (n * sum_xy - sum_x * sum_y) / denom
+    offset = (sum_y - speed_factor * sum_x) / n
+
+    speed_factor = max(0.95, min(1.05, speed_factor))
+
+    print("  Phase 4 result: offset={:.6f}s  speed={:.8f}  ({} pairs)".format(
+        offset, speed_factor, n), flush=True)
+    return offset, speed_factor
 
 # ---------------------------------------------------------------------------
 # 3-phase matching
@@ -451,6 +622,39 @@ def match_slot(source, viewer_path, viewer_info, work_dir, threshold):
     """
     slot_id = source["id"]
     viewer_duration = viewer_info["duration_seconds"]
+
+    orig = source.get("original", {})
+
+    # SHA256 shortcut: if the viewer file is the exact file used during signing,
+    # skip all fingerprint matching - the transform is identity.
+    recipe_sha256 = orig.get("sha256")
+    if recipe_sha256:
+        print("  Checking SHA256...", flush=True)
+        viewer_sha256 = compute_sha256(viewer_path)
+        if viewer_sha256 == recipe_sha256:
+            print("  SHA256 match: exact source file. Skipping fingerprint matching.",
+                  flush=True)
+            trim = compute_trim_points(source, 0.0, 1.0, viewer_duration)
+            return {
+                "slot_id": slot_id,
+                "slot_name": source.get("name", ""),
+                "status": "suitable",
+                "match_rate": 1.0,
+                "match_method": "sha256_exact",
+                "input_file": viewer_path,
+                "transform": {
+                    "offset_seconds": 0.0,
+                    "speed_factor": 1.0,
+                    "trim_start_seconds": trim["trim_start_seconds"],
+                    "trim_duration_seconds": trim["trim_duration_seconds"],
+                    "fps_in": viewer_info["fps"],
+                    "fps_out": orig.get("fps"),
+                    "resolution_in": [viewer_info["resolution_x"], viewer_info["resolution_y"]],
+                    "resolution_out": [orig.get("resolution_x"), orig.get("resolution_y")],
+                },
+                "output_filename": orig.get("filename", "{}_conformed.mkv".format(slot_id)),
+            }
+
     frames_dir = os.path.join(work_dir, "{}_frames".format(slot_id))
 
     # Fingerprint the viewer file
@@ -478,17 +682,21 @@ def match_slot(source, viewer_path, viewer_info, work_dir, threshold):
         recipe_anchors, viewer_audio_map, viewer_video_map,
         refined_offset, speed_factor)
 
+    # Phase 4: frame-precise alignment using cut sequences
+    final_offset, final_speed = phase4_fine_pass(
+        recipe_anchors, viewer_path, final_offset, final_speed, work_dir)
+
     suitable = match_rate >= threshold
 
     # Compute trim points
     trim = compute_trim_points(source, final_offset, final_speed, viewer_duration)
 
-    orig = source.get("original", {})
     result = {
         "slot_id": slot_id,
         "slot_name": source.get("name", ""),
         "status": "suitable" if suitable else "unsuitable",
         "match_rate": round(match_rate, 4),
+        "match_method": "fingerprint",
         "input_file": viewer_path,
         "transform": {
             "offset_seconds": round(final_offset, 6),
