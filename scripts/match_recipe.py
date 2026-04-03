@@ -35,8 +35,8 @@ def parse_args():
     p.add_argument("--recipe", required=True)
     p.add_argument("--output", required=True, help="Path to write conform plan YAML")
     p.add_argument("--slot", action="append", default=[], metavar="slot_id=/path/to/file")
-    p.add_argument("--threshold", type=float, default=0.85,
-                   help="Minimum match rate to consider a file suitable (default 0.85)")
+    p.add_argument("--threshold", type=float, default=0.65,
+                   help="Minimum match rate to consider a file suitable (default 0.65)")
     p.add_argument("--work-dir", default="/work/tmp")
     return p.parse_args()
 
@@ -499,6 +499,25 @@ def build_popcount_signal(phash_list):
     return [phash_to_popcount(h) for h in phash_list]
 
 
+def build_motion_signal(phash_list):
+    """
+    Build a frame-to-frame pHash distance signal (temporal gradient).
+
+    signal[i] = hamming_distance(phash[i], phash[i+1])
+
+    This is encode-agnostic: scene cuts produce identical spikes (distance ~30-60)
+    regardless of codec, resolution, or color grading. Static shots produce low
+    values (~0-5). The pattern is preserved across all versions of the same content,
+    making it a far more discriminative cross-correlation signal than popcount.
+
+    Returns a list of length len(phash_list)-1.
+    """
+    signal = []
+    for i in range(len(phash_list) - 1):
+        signal.append(phash_distance(phash_list[i], phash_list[i + 1]))
+    return signal
+
+
 def extract_viewer_phash_sequence(viewer_path, duration_seconds, dense_fps, seq_dir):
     """
     Extract frames from the viewer file at dense_fps and compute pHash for each.
@@ -537,21 +556,26 @@ def extract_viewer_phash_sequence(viewer_path, duration_seconds, dense_fps, seq_
 
 
 def crosscorr_scan(recipe_signal, viewer_signal, interval,
-                   offset_min, offset_max, step):
+                   offset_min, offset_max, step, max_val=64):
     """
     Slide viewer_signal over recipe_signal within [offset_min, offset_max].
     offset is in seconds; step is in seconds.
-    Score = sum of agreement (64 - |r_pop - v_pop|) over the overlap window.
-    Returns (best_offset_seconds, best_score).
+
+    Score = normalized agreement: mean of (max_val - |r[i] - v[i+shift]|) over overlap.
+    Works for both popcount signals (max_val=64) and motion signals (max_val=64).
+
+    Normalizing by overlap count makes the score fair regardless of whether the
+    viewer is longer or shorter than the recipe (extended credits, pre-roll, etc.).
+    Requires at least 10% of recipe length to overlap before trusting a candidate.
+
+    Returns (best_offset_seconds, best_normalized_score).
     """
     best_offset = 0.0
-    best_score = -1
+    best_score = -1.0
+    min_overlap = max(10, len(recipe_signal) // 10)
 
     offset = offset_min
     while offset <= offset_max + 1e-9:
-        # Convert offset to index shift in the viewer signal
-        # viewer_index = recipe_index + shift
-        # t_viewer = t_recipe + offset => viewer_index = recipe_index + offset/interval
         shift = int(round(offset / interval))
         score = 0
         count = 0
@@ -559,34 +583,39 @@ def crosscorr_scan(recipe_signal, viewer_signal, interval,
             vi = ri + shift
             if vi < 0 or vi >= len(viewer_signal):
                 continue
-            score += 64 - abs(r_val - viewer_signal[vi])
+            score += max_val - abs(r_val - viewer_signal[vi])
             count += 1
-        if count > 0 and score > best_score:
-            best_score = score
-            best_offset = offset
+        if count >= min_overlap:
+            norm_score = score / count
+            if norm_score > best_score:
+                best_score = norm_score
+                best_offset = offset
         offset += step
 
     return best_offset, best_score
 
 
-def crosscorr_pass1(recipe_seq, viewer_seq, search_min=-120.0, search_max=300.0):
+def crosscorr_pass1(recipe_seq, viewer_seq, search_min=-600.0, search_max=600.0):
     """
     Coarse cross-correlation: downsample both signals to ~1fps, scan full range.
     Returns (coarse_offset_seconds, score).
     """
     print("  XCorr Pass 1: coarse scan ({:.0f}s to +{:.0f}s)...".format(
-        abs(search_min), search_max), flush=True)
+        search_min, search_max), flush=True)
 
     interval = recipe_seq["interval"]
-    downsample = max(1, int(round(1.0 / interval)))  # downsample to ~1fps
 
-    r_pop = build_popcount_signal(recipe_seq["phashes"][::downsample])
-    v_pop = build_popcount_signal(viewer_seq["phashes"][::downsample])
+    # Use full-density motion signal - do NOT downsample. Downsampling can drop
+    # scene cuts that fall between sampled frames, killing the signal's peaks.
+    # Instead scan in coarse 1s steps over the full-density signal.
+    r_motion = build_motion_signal(recipe_seq["phashes"])
+    v_motion = build_motion_signal(viewer_seq["phashes"])
 
-    step = interval * downsample  # ~1.0s step
-    offset, score = crosscorr_scan(r_pop, v_pop, step, search_min, search_max, step)
+    coarse_step = 1.0  # scan in 1s steps for speed; Pass 2 refines to 0.25s
+    offset, score = crosscorr_scan(r_motion, v_motion, interval, search_min, search_max,
+                                   coarse_step)
 
-    print("  Pass 1 result: offset={:.2f}s  score={:.0f}".format(offset, score), flush=True)
+    print("  Pass 1 result: offset={:.2f}s  score={:.2f}".format(offset, score), flush=True)
     return offset, score
 
 
@@ -599,15 +628,15 @@ def crosscorr_pass2(recipe_seq, viewer_seq, coarse_offset, window=4.0):
         coarse_offset, window), flush=True)
 
     interval = recipe_seq["interval"]
-    r_pop = build_popcount_signal(recipe_seq["phashes"])
-    v_pop = build_popcount_signal(viewer_seq["phashes"])
+    r_motion = build_motion_signal(recipe_seq["phashes"])
+    v_motion = build_motion_signal(viewer_seq["phashes"])
 
     search_min = coarse_offset - window
     search_max = coarse_offset + window
 
-    offset, score = crosscorr_scan(r_pop, v_pop, interval, search_min, search_max, interval)
+    offset, score = crosscorr_scan(r_motion, v_motion, interval, search_min, search_max, interval)
 
-    print("  Pass 2 result: offset={:.4f}s  score={:.0f}".format(offset, score), flush=True)
+    print("  Pass 2 result: offset={:.4f}s  score={:.2f}".format(offset, score), flush=True)
     return offset, score
 
 
@@ -630,13 +659,19 @@ def crosscorr_pass3_speed(recipe_seq, viewer_seq, fine_offset, n_segments=5, win
               flush=True)
         return fine_offset, 1.0
 
+    # Score threshold: a segment whose best normalized xcorr score is below this
+    # is assumed to have no corresponding content in the viewer (e.g. pre-roll or
+    # credits that differ between versions). Exclude it from the speed regression.
+    # 42/64 = ~65% agreement - well above random (which is ~50% for natural images).
+    SEG_SCORE_THRESHOLD = 42.0
+
     pairs = []  # (recipe_midpoint_tc, local_offset)
     for i in range(n_segments):
         seg_start = i * seg_size
         seg_end = min(seg_start + seg_size, r_len)
         seg_mid_tc = (seg_start + (seg_end - seg_start) / 2.0) * interval
 
-        r_seg_pop = build_popcount_signal(r_hashes[seg_start:seg_end])
+        r_seg_motion = build_motion_signal(r_hashes[seg_start:seg_end])
 
         # Determine viewer slice for this segment at the expected offset
         v_start_idx = int(round((seg_mid_tc - seg_size * interval / 2.0 + fine_offset) / interval))
@@ -644,15 +679,27 @@ def crosscorr_pass3_speed(recipe_seq, viewer_seq, fine_offset, n_segments=5, win
         pad = int(round(window / interval))
         v_lo = max(0, v_start_idx - pad)
         v_hi = min(len(v_hashes), v_start_idx + seg_size + pad)
-        v_seg_pop = build_popcount_signal(v_hashes[v_lo:v_hi])
+        if v_hi <= v_lo:
+            print("  Pass 3: segment {} has no viewer content, skipping.".format(i), flush=True)
+            continue
+        v_seg_motion = build_motion_signal(v_hashes[v_lo:v_hi])
 
         seg_offset_min = fine_offset - window
         seg_offset_max = fine_offset + window
         local_off, local_score = crosscorr_scan(
-            r_seg_pop, v_seg_pop, interval,
+            r_seg_motion, v_seg_motion, interval,
             seg_offset_min, seg_offset_max, interval,
         )
+        if local_score < SEG_SCORE_THRESHOLD:
+            print("  Pass 3: segment {} low score ({:.1f}), skipping (credits/pre-roll?).".format(
+                i, local_score), flush=True)
+            continue
         pairs.append((seg_mid_tc, local_off))
+
+    if len(pairs) < 2:
+        print("  Pass 3: only {} usable segments, keeping fine offset.".format(len(pairs)),
+              flush=True)
+        return fine_offset, 1.0
 
     # Linear regression: local_offset = base_offset + (speed_factor - 1) * tc
     # i.e. viewer_tc = recipe_tc * speed_factor + base_offset
@@ -959,21 +1006,37 @@ def match_slot(source, viewer_path, viewer_info, work_dir, threshold):
 
         final_offset, final_speed = xcorr_match(recipe_seq, viewer_seq)
 
-        # Compute match_rate using anchor scoring (with floor/ceil fix)
-        # Need viewer audio+video maps for anchor_matches
+        # Compute match_rate directly from dense sequences at the computed offset.
+        # For each recipe frame, find the expected viewer frame index and compare pHash.
+        # This avoids the 1fps integer-snapping problem entirely.
+        r_hashes = recipe_seq["phashes"]
+        v_hashes = viewer_seq["phashes"]
+        r_interval = recipe_seq["interval"]
+        v_interval = viewer_seq["interval"]
+        PHASH_MATCH_THRESHOLD = 15  # relaxed for cross-encode matching (DVDRip, Xvid etc.)
+
+        matches = 0
+        tested = 0
+        for i, r_hash in enumerate(r_hashes):
+            t_r = i * r_interval
+            t_v = t_r * final_speed + final_offset
+            if t_v < 0:
+                continue
+            j = int(round(t_v / v_interval))
+            if j < 0 or j >= len(v_hashes):
+                continue
+            tested += 1
+            if phash_distance(r_hash, v_hashes[j]) < PHASH_MATCH_THRESHOLD:
+                matches += 1
+
+        match_rate = matches / tested if tested > 0 else 0.0
+        print("  Match rate (dense xcorr): {:.1%}  ({}/{} frames)".format(
+            match_rate, matches, tested), flush=True)
+
+        # Still need audio+video maps for Phase 4 (cut sequence fine pass)
         viewer_audio_map = fingerprint_viewer_audio(viewer_path, viewer_duration)
         viewer_video_map = fingerprint_viewer_video(viewer_path, viewer_duration,
                                                     os.path.join(frames_dir, "1fps"))
-        if recipe_anchors:
-            matches, tested = score_offset(
-                recipe_anchors, viewer_audio_map, viewer_video_map,
-                final_offset, speed_factor=final_speed, sample_step=1,
-            )
-            match_rate = matches / tested if tested > 0 else 0.0
-        else:
-            match_rate = 0.85  # no anchors to score against; trust xcorr result
-
-        print("  Match rate (anchor check): {:.1%}".format(match_rate), flush=True)
         match_method = "xcorr"
     else:
         # Legacy 3-phase path (old recipes signed at 1fps without phash_sequence)
