@@ -747,8 +747,159 @@ def cmd_match(args):
     if result.returncode != 0:
         die("match failed (exit {})".format(result.returncode))
 
+    # The container wrote container-internal paths as input_file values.
+    # Replace them with the real host paths so the conform plan is portable.
+    # The file may be root-owned (Docker writes as root), so write to a sibling
+    # temp file and rename over it - rename only needs directory write permission.
+    if os.path.exists(output_path):
+        with open(output_path) as f:
+            content = f.read()
+        for src in slots:
+            sid = src["id"]
+            if sid not in slot_file_map:
+                continue
+            host_file = slot_file_map[sid]
+            filename = os.path.basename(host_file)
+            container_path = "/work/candidates/{}/{}".format(sid, filename)
+            content = content.replace(container_path, host_file)
+        tmp_path = output_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            f.write(content)
+        os.replace(tmp_path, output_path)
+
     print("Conform plan written to: {}".format(output_path))
 
+
+def parse_conform_plan_minimal(plan_path):
+    """
+    Extract what cmd_conform needs from a conform plan without a YAML parser.
+    Returns dict with:
+      all_suitable: bool
+      sources: list of {slot_id, status, input_file, output_filename}
+    """
+    result = {"all_suitable": False, "sources": []}
+    current_source = None
+    in_sources = False
+
+    with open(plan_path) as f:
+        for raw_line in f:
+            line = raw_line.rstrip()
+            stripped = line.lstrip()
+            indent = len(line) - len(stripped)
+
+            if not stripped:
+                continue
+
+            if line.startswith("all_suitable:"):
+                val = line.split(":", 1)[1].strip().lower()
+                result["all_suitable"] = val == "true"
+                continue
+
+            if line == "sources:":
+                in_sources = True
+                continue
+
+            if in_sources and indent == 0 and ":" in stripped and not stripped.startswith("-"):
+                in_sources = False
+                current_source = None
+                continue
+
+            if not in_sources:
+                continue
+
+            if stripped.startswith("- slot_id:"):
+                if current_source:
+                    result["sources"].append(current_source)
+                sid = stripped.split(":", 1)[1].strip().strip('"')
+                current_source = {
+                    "slot_id": sid,
+                    "status": None,
+                    "input_file": None,
+                    "output_filename": None,
+                }
+                continue
+
+            if current_source is None:
+                continue
+
+            if stripped.startswith("status:"):
+                current_source["status"] = stripped.split(":", 1)[1].strip().strip('"')
+            elif stripped.startswith("input_file:"):
+                current_source["input_file"] = stripped.split(":", 1)[1].strip().strip('"')
+            elif stripped.startswith("output_filename:"):
+                current_source["output_filename"] = stripped.split(":", 1)[1].strip().strip('"')
+
+    if current_source:
+        result["sources"].append(current_source)
+
+    return result
+
+
+def cmd_conform(args):
+    plan_path = os.path.abspath(args.conform_plan)
+    if not os.path.exists(plan_path):
+        die("Conform plan not found: {}".format(plan_path))
+
+    plan_meta = parse_conform_plan_minimal(plan_path)
+
+    if not plan_meta["sources"]:
+        die("No sources found in conform plan.")
+
+    suitable = [s for s in plan_meta["sources"] if s.get("status") == "suitable"]
+    if not suitable:
+        die("No suitable sources in conform plan. Re-run match.")
+
+    if not plan_meta["all_suitable"]:
+        print("WARNING: not all sources are suitable. Only suitable sources will be conformed.")
+
+    # Validate input files exist on the host
+    for source in suitable:
+        input_file = source.get("input_file")
+        if not input_file:
+            die("No input_file recorded for slot {}. Re-run match.".format(source["slot_id"]))
+        if not os.path.exists(input_file):
+            die("Input file not found for {}: {}".format(source["slot_id"], input_file))
+
+    work_dir = os.path.abspath(args.work_dir)
+    os.makedirs(work_dir, exist_ok=True)
+
+    ensure_image()
+
+    plan_dir = os.path.dirname(plan_path)
+    plan_filename = os.path.basename(plan_path)
+
+    mounts = [
+        (plan_dir, "/work/plan", "ro"),
+        (work_dir, "/work/output", "rw"),
+        (SCRIPTS_DIR, "/scripts", "ro"),
+    ]
+
+    conform_cmd = [
+        "python3", "/scripts/conform_sources.py",
+        "--plan", "/work/plan/{}".format(plan_filename),
+        "--work-dir", "/work/output",
+    ]
+
+    # Mount each input file and pass container path via --slot
+    for source in suitable:
+        slot_id = source["slot_id"]
+        host_file = source["input_file"]
+        filename = os.path.basename(host_file)
+        container_path = "/work/sources/{}/{}".format(slot_id, filename)
+        mounts.append((host_file, container_path, "ro"))
+        conform_cmd += ["--slot", "{}={}".format(slot_id, container_path)]
+
+    print("Conforming sources from: {}".format(plan_filename))
+    for source in suitable:
+        print("  {} -> {}".format(source["slot_id"], source.get("output_filename", "?")))
+    print()
+
+    result = run_docker(DOCKER_IMAGE, mounts, conform_cmd)
+
+    if result.returncode != 0:
+        die("conform failed (exit {})".format(result.returncode))
+
+    print("\nConformed files written to: {}".format(work_dir))
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -820,6 +971,17 @@ def main():
                          metavar="<0.0-1.0>",
                          help="Minimum anchor match rate for a file to be suitable (default: 0.85)")
     p_match.set_defaults(func=cmd_match)
+
+    # conform
+    p_conform = sub.add_parser(
+        "conform",
+        help="Apply timing transforms from a conform plan to produce conformed source files",
+    )
+    p_conform.add_argument("conform_plan", metavar="<conform_plan.yaml>")
+    p_conform.add_argument("--work-dir", default="./grey17_work",
+                           metavar="<dir>",
+                           help="Directory to write conformed files into (default: ./grey17_work/)")
+    p_conform.set_defaults(func=cmd_conform)
 
     # inspect (debug)
     p_inspect = sub.add_parser(
