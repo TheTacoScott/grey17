@@ -693,9 +693,34 @@ def match_slot(source, viewer_path, viewer_info, work_dir, threshold):
 
     orig = source.get("original", {})
 
-    # SHA256 shortcut disabled (re-enable by restoring this block)
-    # recipe_sha256 = orig.get("sha256")
-    # if recipe_sha256: ...
+    # SHA256 shortcut: exact file match bypasses all fingerprint work
+    recipe_sha256 = orig.get("sha256")
+    if recipe_sha256:
+        print("  Computing SHA256...", flush=True)
+        viewer_sha256 = compute_sha256(viewer_path)
+        if viewer_sha256 == recipe_sha256:
+            print("  SHA256 match - exact file, skipping fingerprint.", flush=True)
+            transform = {
+                "offset_seconds": 0.0,
+                "speed_factor": 1.0,
+                "trim_start_seconds": 0.0,
+                "trim_duration_seconds": round(viewer_duration, 6),
+                "fps_in": viewer_info["fps"],
+                "fps_out": orig.get("fps"),
+                "resolution_in": [viewer_info["resolution_x"], viewer_info["resolution_y"]],
+                "resolution_out": [orig.get("resolution_x"), orig.get("resolution_y")],
+            }
+            return {
+                "slot_id": slot_id,
+                "slot_name": source.get("name", ""),
+                "status": "suitable",
+                "match_rate": 1.0,
+                "match_method": "sha256",
+                "input_file": viewer_path,
+                "transform": transform,
+                "output_filename": orig.get("filename", "{}_conformed.mkv".format(slot_id)),
+            }
+        print("  SHA256 mismatch - proceeding with fingerprint matching.", flush=True)
 
     frames_dir = os.path.join(work_dir, "{}_frames".format(slot_id))
 
