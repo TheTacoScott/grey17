@@ -207,6 +207,10 @@ def manifest_to_recipe(manifest, blend_path, title, author, blend_dir_host=None)
             "name": "",
             "description": "",
             "required": True,
+            # Set to true if the author's source has no black bars (full frame).
+            # When true, grey17 match will run crop detection on viewer-supplied
+            # files and trim any pillarbox/letterbox bars during conform.
+            "expect_full_frame": False,
             "original": {
                 "filename": src["filename"],
                 "filepath_on_author_machine": host_path(src["filepath"]),

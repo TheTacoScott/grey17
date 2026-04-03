@@ -405,6 +405,74 @@ def phase4_fine_pass(recipe_anchors, viewer_path, rough_offset, rough_speed, wor
     return offset, speed_factor
 
 # ---------------------------------------------------------------------------
+# Crop detection
+# ---------------------------------------------------------------------------
+
+def detect_crop(viewer_path, duration, native_w, native_h):
+    """
+    Use ffmpeg cropdetect to find black bars in the viewer file.
+
+    Samples frames from 5-85% of the video duration (avoids opening/ending
+    credits and fade-to-black sequences). Runs cropdetect on ~300 evenly
+    spaced frames and takes the mode (most common) crop value.
+
+    Returns dict {w, h, x, y} if a significant crop is detected, else None.
+    A crop is considered significant if it differs from the native resolution
+    by more than THRESHOLD pixels on any side.
+    """
+    THRESHOLD = 8
+    STABLE_FRACTION = 0.50  # crop value must appear in >=50% of frames
+
+    start = duration * 0.05
+    sample_duration = duration * 0.80
+    target_samples = 300
+    fps_sample = max(0.1, target_samples / sample_duration)
+
+    cmd = [
+        "ffmpeg",
+        "-ss", "{:.3f}".format(start),
+        "-i", viewer_path,
+        "-t", "{:.3f}".format(sample_duration),
+        "-vf", "fps={:.4f},cropdetect=limit=24:round=2:reset=0".format(fps_sample),
+        "-an", "-f", "null", "-",
+        "-hide_banner",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    # cropdetect outputs to stderr: "crop=W:H:X:Y" at the end of each line
+    crop_counts = {}
+    for line in result.stderr.splitlines():
+        if "crop=" not in line:
+            continue
+        idx = line.rfind("crop=")
+        val = line[idx + 5:].split()[0] if line[idx + 5:].split() else ""
+        parts = val.split(":")
+        if len(parts) != 4:
+            continue
+        try:
+            w, h, x, y = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+        except ValueError:
+            continue
+        crop_counts[(w, h, x, y)] = crop_counts.get((w, h, x, y), 0) + 1
+
+    if not crop_counts:
+        return None
+
+    total = sum(crop_counts.values())
+    (w, h, x, y), count = max(crop_counts.items(), key=lambda kv: kv[1])
+
+    if count / total < STABLE_FRACTION:
+        return None
+
+    # Check if crop is meaningfully different from native resolution
+    cropped_right = (native_w - (x + w))
+    cropped_bottom = (native_h - (y + h))
+    if x <= THRESHOLD and y <= THRESHOLD and cropped_right <= THRESHOLD and cropped_bottom <= THRESHOLD:
+        return None
+
+    return {"w": w, "h": h, "x": x, "y": y}
+
+# ---------------------------------------------------------------------------
 # 3-phase matching
 # ---------------------------------------------------------------------------
 
@@ -625,35 +693,9 @@ def match_slot(source, viewer_path, viewer_info, work_dir, threshold):
 
     orig = source.get("original", {})
 
-    # SHA256 shortcut: if the viewer file is the exact file used during signing,
-    # skip all fingerprint matching - the transform is identity.
-    recipe_sha256 = orig.get("sha256")
-    if recipe_sha256:
-        print("  Checking SHA256...", flush=True)
-        viewer_sha256 = compute_sha256(viewer_path)
-        if viewer_sha256 == recipe_sha256:
-            print("  SHA256 match: exact source file. Skipping fingerprint matching.",
-                  flush=True)
-            trim = compute_trim_points(source, 0.0, 1.0, viewer_duration)
-            return {
-                "slot_id": slot_id,
-                "slot_name": source.get("name", ""),
-                "status": "suitable",
-                "match_rate": 1.0,
-                "match_method": "sha256_exact",
-                "input_file": viewer_path,
-                "transform": {
-                    "offset_seconds": 0.0,
-                    "speed_factor": 1.0,
-                    "trim_start_seconds": trim["trim_start_seconds"],
-                    "trim_duration_seconds": trim["trim_duration_seconds"],
-                    "fps_in": viewer_info["fps"],
-                    "fps_out": orig.get("fps"),
-                    "resolution_in": [viewer_info["resolution_x"], viewer_info["resolution_y"]],
-                    "resolution_out": [orig.get("resolution_x"), orig.get("resolution_y")],
-                },
-                "output_filename": orig.get("filename", "{}_conformed.mkv".format(slot_id)),
-            }
+    # SHA256 shortcut disabled (re-enable by restoring this block)
+    # recipe_sha256 = orig.get("sha256")
+    # if recipe_sha256: ...
 
     frames_dir = os.path.join(work_dir, "{}_frames".format(slot_id))
 
@@ -691,6 +733,39 @@ def match_slot(source, viewer_path, viewer_info, work_dir, threshold):
     # Compute trim points
     trim = compute_trim_points(source, final_offset, final_speed, viewer_duration)
 
+    transform = {
+        "offset_seconds": round(final_offset, 6),
+        "speed_factor": round(final_speed, 8),
+        "trim_start_seconds": trim["trim_start_seconds"],
+        "trim_duration_seconds": trim["trim_duration_seconds"],
+        "fps_in": viewer_info["fps"],
+        "fps_out": orig.get("fps"),
+        "resolution_in": [viewer_info["resolution_x"], viewer_info["resolution_y"]],
+        "resolution_out": [orig.get("resolution_x"), orig.get("resolution_y")],
+    }
+
+    # Crop detection: only when the author flagged the source as full-frame
+    # and the match is suitable (no point detecting crop on a wrong file)
+    if source.get("expect_full_frame") and suitable:
+        print("  Detecting crop (expect_full_frame=true)...", flush=True)
+        crop = detect_crop(
+            viewer_path,
+            viewer_duration,
+            viewer_info["resolution_x"],
+            viewer_info["resolution_y"],
+        )
+        if crop:
+            transform["crop"] = crop
+            print("  Crop detected: {}x{} offset {}x{}  (removing {}px left, {}px top, "
+                  "{}px right, {}px bottom)".format(
+                      crop["w"], crop["h"], crop["x"], crop["y"],
+                      crop["x"], crop["y"],
+                      viewer_info["resolution_x"] - (crop["x"] + crop["w"]),
+                      viewer_info["resolution_y"] - (crop["y"] + crop["h"]),
+                  ), flush=True)
+        else:
+            print("  No significant crop detected.", flush=True)
+
     result = {
         "slot_id": slot_id,
         "slot_name": source.get("name", ""),
@@ -698,16 +773,7 @@ def match_slot(source, viewer_path, viewer_info, work_dir, threshold):
         "match_rate": round(match_rate, 4),
         "match_method": "fingerprint",
         "input_file": viewer_path,
-        "transform": {
-            "offset_seconds": round(final_offset, 6),
-            "speed_factor": round(final_speed, 8),
-            "trim_start_seconds": trim["trim_start_seconds"],
-            "trim_duration_seconds": trim["trim_duration_seconds"],
-            "fps_in": viewer_info["fps"],
-            "fps_out": orig.get("fps"),
-            "resolution_in": [viewer_info["resolution_x"], viewer_info["resolution_y"]],
-            "resolution_out": [orig.get("resolution_x"), orig.get("resolution_y")],
-        },
+        "transform": transform,
         "output_filename": orig.get("filename", "{}_conformed.mkv".format(slot_id)),
     }
     return result

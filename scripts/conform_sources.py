@@ -86,24 +86,37 @@ def conform_source(source, input_file, work_dir):
     res_in = t.get("resolution_in") or [None, None]
     res_out = t.get("resolution_out") or [None, None]
 
+    crop_spec = t.get("crop")
+    apply_crop = bool(crop_spec and crop_spec.get("w") and crop_spec.get("h"))
     apply_speed = abs(speed - 1.0) > 0.0001
     apply_fps = fps_out and fps_in and abs(float(fps_out) - float(fps_in)) > 0.001
+
+    # For scale: compare against post-crop dimensions if crop is applied
+    if apply_crop:
+        effective_in_w = int(crop_spec["w"])
+        effective_in_h = int(crop_spec["h"])
+    else:
+        effective_in_w = res_in[0]
+        effective_in_h = res_in[1]
     apply_scale = (
-        res_out[0] and res_out[1] and res_in[0] and res_in[1] and
-        (int(res_out[0]) != int(res_in[0]) or int(res_out[1]) != int(res_in[1]))
+        res_out[0] and res_out[1] and effective_in_w and effective_in_h and
+        (int(res_out[0]) != effective_in_w or int(res_out[1]) != effective_in_h)
     )
 
     # Print transform summary
     print("  Input:    {}".format(os.path.basename(input_file)), flush=True)
     print("  Offset:   {:.6f}s".format(offset), flush=True)
     print("  Duration: {:.3f}s".format(float(trim_duration) if trim_duration else 0.0), flush=True)
+    if apply_crop:
+        print("  Crop:     {}x{} from ({},{})  [removing black bars]".format(
+            crop_spec["w"], crop_spec["h"], crop_spec["x"], crop_spec["y"]), flush=True)
     if apply_speed:
         print("  Speed:    {:.8f}x".format(speed), flush=True)
     if apply_fps:
         print("  FPS:      {:.6f} -> {:.6f}".format(float(fps_in), float(fps_out)), flush=True)
     if apply_scale:
         print("  Scale:    {}x{} -> {}x{}".format(
-            res_in[0], res_in[1], res_out[0], res_out[1]), flush=True)
+            effective_in_w, effective_in_h, res_out[0], res_out[1]), flush=True)
     print("  Output:   {}".format(output_path), flush=True)
 
     # Build ffmpeg command
@@ -118,8 +131,12 @@ def conform_source(source, input_file, work_dir):
     if trim_duration:
         cmd += ["-t", "{:.6f}".format(float(trim_duration))]
 
-    # Video filter chain
+    # Video filter chain: crop first (on full-res input), then speed/fps/scale
     vf_parts = []
+    if apply_crop:
+        vf_parts.append("crop={}:{}:{}:{}".format(
+            int(crop_spec["w"]), int(crop_spec["h"]),
+            int(crop_spec["x"]), int(crop_spec["y"])))
     if apply_speed:
         # setpts scales the presentation timestamps: slower = higher PTS multiplier
         vf_parts.append("setpts={:.10f}*PTS".format(1.0 / speed))
