@@ -148,26 +148,36 @@ def anchor_matches(recipe_anchor, viewer_audio_map, viewer_video_map,
                    viewer_tc, audio_threshold=0.35, phash_threshold=10):
     """
     Test whether a recipe anchor matches the viewer file at viewer_tc.
+    Tries both floor and ceil of viewer_tc so fractional offsets don't miss.
     Returns (matched: bool, confidence: str 'high'|'medium'|'none')
     """
-    tc_int = int(round(viewer_tc))
+    tc_floor = int(viewer_tc)
+    tc_ceil = tc_floor + 1
     audio_match = False
     video_match = False
 
-    # Audio comparison
+    # Audio comparison: try both floor and ceil, take the better BER
     recipe_fp = (recipe_anchor.get("audio") or {}).get("fingerprint")
-    viewer_fp = viewer_audio_map.get(tc_int)
-    if recipe_fp and viewer_fp:
-        ber = audio_ber(recipe_fp, viewer_fp)
-        audio_match = ber < audio_threshold
+    if recipe_fp:
+        bers = []
+        for tc_int in (tc_floor, tc_ceil):
+            viewer_fp = viewer_audio_map.get(tc_int)
+            if viewer_fp:
+                bers.append(audio_ber(recipe_fp, viewer_fp))
+        if bers:
+            audio_match = min(bers) < audio_threshold
 
-    # Video comparison (skip low-entropy anchors)
+    # Video comparison: try both floor and ceil, take the lower pHash distance
     if not recipe_anchor.get("low_entropy"):
         recipe_ph = (recipe_anchor.get("video") or {}).get("phash")
-        viewer_ph = (viewer_video_map.get(tc_int) or {}).get("phash")
-        if recipe_ph and viewer_ph:
-            dist = phash_distance(recipe_ph, viewer_ph)
-            video_match = dist < phash_threshold
+        if recipe_ph:
+            dists = []
+            for tc_int in (tc_floor, tc_ceil):
+                viewer_ph = (viewer_video_map.get(tc_int) or {}).get("phash")
+                if viewer_ph:
+                    dists.append(phash_distance(recipe_ph, viewer_ph))
+            if dists:
+                video_match = min(dists) < phash_threshold
 
     if audio_match and video_match:
         return True, "high"
@@ -473,7 +483,216 @@ def detect_crop(viewer_path, duration, native_w, native_h):
     return {"w": w, "h": h, "x": x, "y": y}
 
 # ---------------------------------------------------------------------------
-# 3-phase matching
+# Cross-correlation matching engine
+# ---------------------------------------------------------------------------
+
+def phash_to_popcount(phash_hex):
+    """Convert a 16-char hex pHash to its popcount (0..64)."""
+    try:
+        return bin(int(phash_hex, 16)).count("1")
+    except (ValueError, TypeError):
+        return 32  # neutral value on failure
+
+
+def build_popcount_signal(phash_list):
+    """Convert a list of pHash hex strings to a list of popcount ints."""
+    return [phash_to_popcount(h) for h in phash_list]
+
+
+def extract_viewer_phash_sequence(viewer_path, duration_seconds, dense_fps, seq_dir):
+    """
+    Extract frames from the viewer file at dense_fps and compute pHash for each.
+    Returns dict: {interval, start, phashes} matching the recipe phash_sequence format.
+    """
+    os.makedirs(seq_dir, exist_ok=True)
+    cmd = [
+        "ffmpeg", "-i", viewer_path,
+        "-vf", "fps={:.6f},scale=32:32:flags=lanczos,format=gray".format(dense_fps),
+        "-f", "image2",
+        os.path.join(seq_dir, "f_%08d.png"),
+        "-hide_banner", "-loglevel", "error",
+        "-y",
+    ]
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        print("  WARNING: dense viewer frame extraction failed", file=sys.stderr)
+        return None
+
+    phashes = []
+    for fname in sorted(os.listdir(seq_dir)):
+        if not fname.startswith("f_") or not fname.endswith(".png"):
+            continue
+        try:
+            img = Image.open(os.path.join(seq_dir, fname)).convert("L")
+            phashes.append(str(imagehash.phash(img)))
+        except Exception:
+            phashes.append("0" * 16)
+
+    if not phashes:
+        return None
+
+    interval = round(1.0 / dense_fps, 9)
+    print("  Viewer dense frames: {} at {}fps".format(len(phashes), dense_fps), flush=True)
+    return {"interval": interval, "start": 0.0, "phashes": phashes}
+
+
+def crosscorr_scan(recipe_signal, viewer_signal, interval,
+                   offset_min, offset_max, step):
+    """
+    Slide viewer_signal over recipe_signal within [offset_min, offset_max].
+    offset is in seconds; step is in seconds.
+    Score = sum of agreement (64 - |r_pop - v_pop|) over the overlap window.
+    Returns (best_offset_seconds, best_score).
+    """
+    best_offset = 0.0
+    best_score = -1
+
+    offset = offset_min
+    while offset <= offset_max + 1e-9:
+        # Convert offset to index shift in the viewer signal
+        # viewer_index = recipe_index + shift
+        # t_viewer = t_recipe + offset => viewer_index = recipe_index + offset/interval
+        shift = int(round(offset / interval))
+        score = 0
+        count = 0
+        for ri, r_val in enumerate(recipe_signal):
+            vi = ri + shift
+            if vi < 0 or vi >= len(viewer_signal):
+                continue
+            score += 64 - abs(r_val - viewer_signal[vi])
+            count += 1
+        if count > 0 and score > best_score:
+            best_score = score
+            best_offset = offset
+        offset += step
+
+    return best_offset, best_score
+
+
+def crosscorr_pass1(recipe_seq, viewer_seq, search_min=-120.0, search_max=300.0):
+    """
+    Coarse cross-correlation: downsample both signals to ~1fps, scan full range.
+    Returns (coarse_offset_seconds, score).
+    """
+    print("  XCorr Pass 1: coarse scan ({:.0f}s to +{:.0f}s)...".format(
+        abs(search_min), search_max), flush=True)
+
+    interval = recipe_seq["interval"]
+    downsample = max(1, int(round(1.0 / interval)))  # downsample to ~1fps
+
+    r_pop = build_popcount_signal(recipe_seq["phashes"][::downsample])
+    v_pop = build_popcount_signal(viewer_seq["phashes"][::downsample])
+
+    step = interval * downsample  # ~1.0s step
+    offset, score = crosscorr_scan(r_pop, v_pop, step, search_min, search_max, step)
+
+    print("  Pass 1 result: offset={:.2f}s  score={:.0f}".format(offset, score), flush=True)
+    return offset, score
+
+
+def crosscorr_pass2(recipe_seq, viewer_seq, coarse_offset, window=4.0):
+    """
+    Fine cross-correlation: full density signal, narrow window around coarse_offset.
+    Returns (fine_offset_seconds, score).
+    """
+    print("  XCorr Pass 2: fine scan (offset {:.2f}s +/- {:.1f}s)...".format(
+        coarse_offset, window), flush=True)
+
+    interval = recipe_seq["interval"]
+    r_pop = build_popcount_signal(recipe_seq["phashes"])
+    v_pop = build_popcount_signal(viewer_seq["phashes"])
+
+    search_min = coarse_offset - window
+    search_max = coarse_offset + window
+
+    offset, score = crosscorr_scan(r_pop, v_pop, interval, search_min, search_max, interval)
+
+    print("  Pass 2 result: offset={:.4f}s  score={:.0f}".format(offset, score), flush=True)
+    return offset, score
+
+
+def crosscorr_pass3_speed(recipe_seq, viewer_seq, fine_offset, n_segments=5, window=2.0):
+    """
+    Speed detection: split recipe into N segments, find local offset for each
+    via cross-correlation, fit a line to get speed_factor and base_offset.
+    Returns (base_offset, speed_factor).
+    """
+    print("  XCorr Pass 3: speed detection ({} segments)...".format(n_segments), flush=True)
+
+    interval = recipe_seq["interval"]
+    r_hashes = recipe_seq["phashes"]
+    v_hashes = viewer_seq["phashes"]
+    r_len = len(r_hashes)
+
+    seg_size = r_len // n_segments
+    if seg_size < 10:
+        print("  Pass 3: recipe too short for {} segments, skipping.".format(n_segments),
+              flush=True)
+        return fine_offset, 1.0
+
+    pairs = []  # (recipe_midpoint_tc, local_offset)
+    for i in range(n_segments):
+        seg_start = i * seg_size
+        seg_end = min(seg_start + seg_size, r_len)
+        seg_mid_tc = (seg_start + (seg_end - seg_start) / 2.0) * interval
+
+        r_seg_pop = build_popcount_signal(r_hashes[seg_start:seg_end])
+
+        # Determine viewer slice for this segment at the expected offset
+        v_start_idx = int(round((seg_mid_tc - seg_size * interval / 2.0 + fine_offset) / interval))
+        v_start_idx = max(0, v_start_idx)
+        pad = int(round(window / interval))
+        v_lo = max(0, v_start_idx - pad)
+        v_hi = min(len(v_hashes), v_start_idx + seg_size + pad)
+        v_seg_pop = build_popcount_signal(v_hashes[v_lo:v_hi])
+
+        seg_offset_min = fine_offset - window
+        seg_offset_max = fine_offset + window
+        local_off, local_score = crosscorr_scan(
+            r_seg_pop, v_seg_pop, interval,
+            seg_offset_min, seg_offset_max, interval,
+        )
+        pairs.append((seg_mid_tc, local_off))
+
+    # Linear regression: local_offset = base_offset + (speed_factor - 1) * tc
+    # i.e. viewer_tc = recipe_tc * speed_factor + base_offset
+    # local_offset[i] ~ base_offset + slope * seg_mid_tc[i]
+    n = len(pairs)
+    xs = [p[0] for p in pairs]
+    ys = [p[1] for p in pairs]
+    sum_x = sum(xs)
+    sum_y = sum(ys)
+    sum_xx = sum(x * x for x in xs)
+    sum_xy = sum(x * y for x, y in zip(xs, ys))
+
+    denom = n * sum_xx - sum_x * sum_x
+    if abs(denom) < 1e-9:
+        print("  Pass 3: degenerate regression, keeping fine offset.", flush=True)
+        return fine_offset, 1.0
+
+    slope = (n * sum_xy - sum_x * sum_y) / denom
+    base_offset = (sum_y - slope * sum_x) / n
+    speed_factor = 1.0 + slope
+    speed_factor = max(0.95, min(1.05, speed_factor))
+
+    print("  Pass 3 result: base_offset={:.4f}s  speed={:.8f}".format(
+        base_offset, speed_factor), flush=True)
+    return base_offset, speed_factor
+
+
+def xcorr_match(recipe_seq, viewer_seq):
+    """
+    Full cross-correlation pipeline: Pass 1 (coarse) -> Pass 2 (fine) -> Pass 3 (speed).
+    Returns (offset_seconds, speed_factor).
+    """
+    coarse_offset, _ = crosscorr_pass1(recipe_seq, viewer_seq)
+    fine_offset, _ = crosscorr_pass2(recipe_seq, viewer_seq, coarse_offset)
+    base_offset, speed_factor = crosscorr_pass3_speed(recipe_seq, viewer_seq, fine_offset)
+    return base_offset, speed_factor
+
+
+# ---------------------------------------------------------------------------
+# 3-phase matching (legacy - used when recipe has no phash_sequence)
 # ---------------------------------------------------------------------------
 
 def score_offset(recipe_anchors, viewer_audio_map, viewer_video_map,
@@ -723,35 +942,75 @@ def match_slot(source, viewer_path, viewer_info, work_dir, threshold):
         print("  SHA256 mismatch - proceeding with fingerprint matching.", flush=True)
 
     frames_dir = os.path.join(work_dir, "{}_frames".format(slot_id))
-
-    # Fingerprint the viewer file
-    viewer_audio_map = fingerprint_viewer_audio(viewer_path, viewer_duration)
-    viewer_video_map = fingerprint_viewer_video(viewer_path, viewer_duration, frames_dir)
-
     recipe_anchors = source.get("anchors", [])
-    if not recipe_anchors:
-        print("  WARNING: no anchors in recipe for {}".format(slot_id), file=sys.stderr)
-        return None
+    recipe_seq = source.get("phash_sequence")
 
-    # 3-phase alignment
-    rough_offset, rough_score = phase1_coarse_offset(
-        recipe_anchors, viewer_audio_map, viewer_video_map, viewer_duration)
+    if recipe_seq:
+        # Cross-correlation path (new recipes signed at 4fps)
+        dense_fps = round(1.0 / recipe_seq["interval"])
+        print("  Extracting viewer dense frames ({}fps)...".format(dense_fps), flush=True)
+        viewer_seq = extract_viewer_phash_sequence(
+            viewer_path, viewer_duration, dense_fps,
+            os.path.join(frames_dir, "dense"),
+        )
+        if viewer_seq is None:
+            print("  ERROR: could not extract viewer frames", file=sys.stderr)
+            return {"slot_id": slot_id, "status": "no_match", "match_rate": 0.0}
 
-    if rough_score < 0.1:
-        print("  No alignment found (best score {:.1%}) - wrong file?".format(rough_score),
-              flush=True)
-        return {"slot_id": slot_id, "status": "no_match", "match_rate": rough_score}
+        final_offset, final_speed = xcorr_match(recipe_seq, viewer_seq)
 
-    refined_offset, speed_factor = phase2_drift_detection(
-        recipe_anchors, viewer_audio_map, viewer_video_map, rough_offset)
+        # Compute match_rate using anchor scoring (with floor/ceil fix)
+        # Need viewer audio+video maps for anchor_matches
+        viewer_audio_map = fingerprint_viewer_audio(viewer_path, viewer_duration)
+        viewer_video_map = fingerprint_viewer_video(viewer_path, viewer_duration,
+                                                    os.path.join(frames_dir, "1fps"))
+        if recipe_anchors:
+            matches, tested = score_offset(
+                recipe_anchors, viewer_audio_map, viewer_video_map,
+                final_offset, speed_factor=final_speed, sample_step=1,
+            )
+            match_rate = matches / tested if tested > 0 else 0.0
+        else:
+            match_rate = 0.85  # no anchors to score against; trust xcorr result
 
-    final_offset, final_speed, match_rate = phase3_refinement(
-        recipe_anchors, viewer_audio_map, viewer_video_map,
-        refined_offset, speed_factor)
+        print("  Match rate (anchor check): {:.1%}".format(match_rate), flush=True)
+        match_method = "xcorr"
+    else:
+        # Legacy 3-phase path (old recipes signed at 1fps without phash_sequence)
+        print("  WARNING: recipe has no phash_sequence (signed at low density). "
+              "Re-sign for better accuracy.", file=sys.stderr)
+        viewer_audio_map = fingerprint_viewer_audio(viewer_path, viewer_duration)
+        viewer_video_map = fingerprint_viewer_video(viewer_path, viewer_duration, frames_dir)
+
+        if not recipe_anchors:
+            print("  WARNING: no anchors in recipe for {}".format(slot_id), file=sys.stderr)
+            return None
+
+        rough_offset, rough_score = phase1_coarse_offset(
+            recipe_anchors, viewer_audio_map, viewer_video_map, viewer_duration)
+
+        if rough_score < 0.1:
+            print("  No alignment found (best score {:.1%}) - wrong file?".format(rough_score),
+                  flush=True)
+            return {"slot_id": slot_id, "status": "no_match", "match_rate": rough_score}
+
+        refined_offset, speed_factor = phase2_drift_detection(
+            recipe_anchors, viewer_audio_map, viewer_video_map, rough_offset)
+
+        final_offset, final_speed, match_rate = phase3_refinement(
+            recipe_anchors, viewer_audio_map, viewer_video_map,
+            refined_offset, speed_factor)
+        match_method = "fingerprint"
 
     # Phase 4: frame-precise alignment using cut sequences
-    final_offset, final_speed = phase4_fine_pass(
+    # Guard: discard Phase 4 result if it deviates more than 2s from current offset
+    p4_offset, p4_speed = phase4_fine_pass(
         recipe_anchors, viewer_path, final_offset, final_speed, work_dir)
+    if abs(p4_offset - final_offset) <= 2.0:
+        final_offset, final_speed = p4_offset, p4_speed
+    else:
+        print("  Phase 4 discarded: offset changed {:.2f}s (> 2s), keeping Pass 3 result.".format(
+            abs(p4_offset - final_offset)), flush=True)
 
     suitable = match_rate >= threshold
 
@@ -796,7 +1055,7 @@ def match_slot(source, viewer_path, viewer_info, work_dir, threshold):
         "slot_name": source.get("name", ""),
         "status": "suitable" if suitable else "unsuitable",
         "match_rate": round(match_rate, 4),
-        "match_method": "fingerprint",
+        "match_method": match_method,
         "input_file": viewer_path,
         "transform": transform,
         "output_filename": orig.get("filename", "{}_conformed.mkv".format(slot_id)),

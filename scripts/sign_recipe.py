@@ -201,6 +201,46 @@ def extract_frames_batch(source_path, timecodes_1s, frames_dir):
     return mapping
 
 
+DENSE_FPS = 4.0  # frames per second for phash_sequence (cross-correlation signal)
+
+
+def extract_phash_sequence(source_path, duration_seconds, dense_fps, frames_dir):
+    """
+    Extract frames at dense_fps and compute pHash for each.
+    Returns dict with keys: interval, start, phashes (list of hex strings).
+    The list index maps to timecode: tc = start + index * (1/dense_fps).
+    """
+    seq_dir = os.path.join(frames_dir, "dense")
+    os.makedirs(seq_dir, exist_ok=True)
+    cmd = [
+        "ffmpeg", "-i", source_path,
+        "-vf", "fps={:.6f},scale=32:32:flags=lanczos,format=gray".format(dense_fps),
+        "-f", "image2",
+        os.path.join(seq_dir, "f_%08d.png"),
+        "-hide_banner", "-loglevel", "error",
+        "-y",
+    ]
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        print("WARNING: dense frame extraction failed, skipping phash_sequence", file=sys.stderr)
+        return None
+
+    interval = round(1.0 / dense_fps, 9)
+    phashes = []
+    for fname in sorted(os.listdir(seq_dir)):
+        if not fname.startswith("f_") or not fname.endswith(".png"):
+            continue
+        ph, _ah, _le = compute_hashes(os.path.join(seq_dir, fname))
+        phashes.append(ph if ph else "0" * 16)
+
+    if not phashes:
+        return None
+
+    print("  Dense phash sequence: {} frames at {}fps".format(len(phashes), dense_fps),
+          flush=True)
+    return {"interval": interval, "start": 0.0, "phashes": phashes}
+
+
 def extract_frame_seek(source_path, timecode, out_path):
     """Extract a single frame at a specific timecode using accurate seek."""
     cmd = [
@@ -487,10 +527,14 @@ def sign_source(source, source_path, anchor_interval, work_dir):
     seek_frame_dir = os.path.join(work_dir, "{}_seek_frames".format(source_id))
     os.makedirs(seek_frame_dir, exist_ok=True)
 
-    # --- Video: batch extract 1fps frames ---
+    # --- Video: batch extract 1fps frames (used for per-anchor hashes) ---
     print("  Extracting video frames (1fps pass)...", flush=True)
     interval_frame_map = extract_frames_batch(source_path, None, frames_dir)
     print("  Extracted {} interval frames".format(len(interval_frame_map)), flush=True)
+
+    # --- Dense phash sequence at DENSE_FPS for cross-correlation matching ---
+    print("  Extracting dense phash sequence ({}fps)...".format(DENSE_FPS), flush=True)
+    phash_sequence = extract_phash_sequence(source_path, duration, DENSE_FPS, frames_dir)
 
     # --- Audio: batch fpcalc per-second fingerprints ---
     print("  Computing audio fingerprints (fpcalc batch)...", flush=True)
@@ -563,7 +607,7 @@ def sign_source(source, source_path, anchor_interval, work_dir):
         n_seq = sum(1 for a in cut_anchors if "cut_sequence" in a)
         print("  Cut sequences extracted: {}".format(n_seq), flush=True)
 
-    return meta, anchors
+    return meta, anchors, phash_sequence
 
 # ---------------------------------------------------------------------------
 # Main
@@ -591,7 +635,7 @@ def main():
 
         print("\nSigning {} ({})".format(slot_id, os.path.basename(source_path)), flush=True)
         try:
-            meta, anchors = sign_source(
+            meta, anchors, phash_sequence = sign_source(
                 source, source_path,
                 args.anchor_interval, work_dir,
             )
@@ -620,6 +664,10 @@ def main():
         orig["audio_channels"] = meta["audio_channels"]
         orig["audio_sample_rate"] = meta["audio_sample_rate"]
         source["anchors"] = anchors
+        if phash_sequence:
+            source["phash_sequence"] = phash_sequence
+            print("  {} dense phash frames written for {}".format(
+                len(phash_sequence["phashes"]), slot_id), flush=True)
         print("  {} anchors written for {}".format(len(anchors), slot_id), flush=True)
 
     recipe["signed"] = True
