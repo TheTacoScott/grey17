@@ -770,6 +770,284 @@ def cmd_match(args):
     print("Conform plan written to: {}".format(output_path))
 
 
+def parse_recipe_for_cook(recipe_path):
+    """
+    Extract what cmd_cook needs from a recipe: source paths, output settings,
+    scene frame range. Returns dict with keys: sources, output, scene.
+    """
+    result = {
+        "sources": [],
+        "output": {},
+        "scene": {},
+    }
+    current_source = None
+    in_sources = False
+    in_original = False
+    in_output = False
+    in_scene = False
+
+    lines = []
+    with open(recipe_path) as f:
+        for raw_line in f:
+            lines.append(raw_line.rstrip())
+
+    # Join PyYAML-wrapped long values: a line that is a plain key: value followed
+    # by continuation lines (more indented, not starting a new key) gets joined.
+    joined = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+        # Check if this line has a key: value that might have been wrapped
+        if ":" in stripped and not stripped.startswith("-") and not stripped.startswith("#"):
+            k, _, v = stripped.partition(":")
+            v = v.strip()
+            if v:  # has a value - check for continuation lines
+                while i + 1 < len(lines):
+                    next_line = lines[i + 1]
+                    next_stripped = next_line.lstrip()
+                    next_indent = len(next_line) - len(next_stripped)
+                    # Continuation: more indented AND not a new key (no ': ' at key level)
+                    if next_indent > indent and ":" not in next_stripped.split()[0] if next_stripped else False:
+                        v = v + " " + next_stripped
+                        i += 1
+                    else:
+                        break
+                joined.append(" " * indent + k + ": " + v)
+                i += 1
+                continue
+        joined.append(line)
+        i += 1
+
+    for line in joined:
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+
+        if not stripped:
+            continue
+
+        # Top-level block transitions (only plain keys, not list items)
+        if indent == 0 and ":" in stripped and not stripped.startswith("#") \
+                and not stripped.startswith("-"):
+            key = stripped.split(":")[0]
+            in_sources = key == "sources"
+            in_output = key == "output"
+            in_scene = key == "scene"
+            in_original = False
+            if in_sources:
+                continue
+
+        if in_output and indent > 0:
+            k, _, v = stripped.partition(":")
+            v = v.strip().strip('"')
+            if v:
+                try:
+                    result["output"][k.strip()] = int(v)
+                except ValueError:
+                    try:
+                        result["output"][k.strip()] = float(v)
+                    except ValueError:
+                        result["output"][k.strip()] = v
+            continue
+
+        if in_scene and indent > 0:
+            k, _, v = stripped.partition(":")
+            v = v.strip().strip('"')
+            if v:
+                try:
+                    result["scene"][k.strip()] = int(v)
+                except ValueError:
+                    try:
+                        result["scene"][k.strip()] = float(v)
+                    except ValueError:
+                        result["scene"][k.strip()] = v
+            continue
+
+        if not in_sources:
+            continue
+
+        if stripped.startswith("- id:"):
+            if current_source:
+                result["sources"].append(current_source)
+            sid = stripped.split(":", 1)[1].strip()
+            current_source = {"id": sid, "filename": None, "filepath_on_author_machine": None}
+            in_original = False
+            continue
+
+        if current_source is None:
+            continue
+
+        if stripped == "original:":
+            in_original = True
+            continue
+
+        if in_original:
+            if stripped.startswith("filename:"):
+                current_source["filename"] = stripped.split(":", 1)[1].strip().strip('"')
+            elif stripped.startswith("filepath_on_author_machine:"):
+                current_source["filepath_on_author_machine"] = (
+                    stripped.split(":", 1)[1].strip().strip('"'))
+            elif indent <= 4 and ":" in stripped and not stripped.startswith("#"):
+                in_original = False
+
+    if current_source:
+        result["sources"].append(current_source)
+
+    return result
+
+
+def cmd_cook(args):
+    blend_path = os.path.abspath(args.blend_file)
+    recipe_path = os.path.abspath(args.recipe)
+
+    if not os.path.exists(blend_path):
+        die("Blend file not found: {}".format(blend_path))
+    if not os.path.exists(recipe_path):
+        die("Recipe file not found: {}".format(recipe_path))
+
+    work_dir = os.path.abspath(args.work_dir)
+    if not os.path.isdir(work_dir):
+        die("Work dir not found: {}. Run grey17 conform first.".format(work_dir))
+
+    recipe = parse_recipe_for_cook(recipe_path)
+
+    if not recipe["sources"]:
+        die("No sources found in recipe.")
+
+    # Check conformed files exist and build original path -> conformed filename map
+    path_map = {}
+    for src in recipe["sources"]:
+        orig_path = src.get("filepath_on_author_machine")
+        filename = src.get("filename")
+        if not orig_path or not filename:
+            print("WARNING: incomplete source entry for {}, skipping".format(src["id"]))
+            continue
+        conformed = os.path.join(work_dir, filename)
+        if not os.path.exists(conformed):
+            die("Conformed file not found for {}: {}\n"
+                "Run grey17 conform first.".format(src["id"], conformed))
+        path_map[orig_path] = filename
+
+    if not path_map:
+        die("No source path mappings could be built from recipe.")
+
+    # Determine output format and path
+    out = recipe.get("output", {})
+    scene = recipe.get("scene", {})
+    out_format = args.format or str(out.get("format", "mkv"))
+    blend_stem = os.path.splitext(os.path.basename(blend_path))[0]
+
+    if args.output:
+        final_output = os.path.abspath(args.output)
+    else:
+        output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grey17_output")
+        os.makedirs(output_dir, exist_ok=True)
+        final_output = os.path.join(output_dir, "{}.{}".format(blend_stem, out_format))
+
+    final_output_dir = os.path.dirname(os.path.abspath(final_output))
+    os.makedirs(final_output_dir, exist_ok=True)
+
+    # Scratch dir for the patched .blend copy
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    scratch_dir = os.path.join(project_root, "tmp", "_cook_scratch")
+    os.makedirs(scratch_dir, exist_ok=True)
+
+    ensure_image()
+
+    blend_dir = os.path.dirname(blend_path)
+    blend_filename = os.path.basename(blend_path)
+
+    mounts = [
+        (blend_dir, "/work/blend", "ro"),
+        (work_dir, "/work/conformed", "ro"),
+        (scratch_dir, "/work/scratch", "rw"),
+        (final_output_dir, "/work/output", "rw"),
+        (SCRIPTS_DIR, "/scripts", "ro"),
+    ]
+
+    # Step 1: patch the .blend copy
+    patched_blend = "/work/scratch/patched.blend"
+    patch_cmd = [
+        "blender",
+        "--background", "/work/blend/{}".format(blend_filename),
+        "--python", "/scripts/patch_blend_paths.py",
+        "--",
+        "--output", patched_blend,
+    ]
+    for orig_path, filename in path_map.items():
+        container_conformed = "/work/conformed/{}".format(filename)
+        # Map the original author path (for blends with absolute paths)
+        patch_cmd += ["--map", "{}={}".format(orig_path, container_conformed)]
+        # Also map the container-resolved path: Blender resolves relative strip
+        # paths (e.g. //film.mkv) relative to the blend file's location inside
+        # the container (/work/blend/), so we need this entry too.
+        container_blend_path = "/work/blend/{}".format(filename)
+        patch_cmd += ["--map", "{}={}".format(container_blend_path, container_conformed)]
+
+    print("Step 1: Patching .blend source paths...")
+    for orig, fname in path_map.items():
+        print("  {} -> /work/conformed/{}".format(os.path.basename(orig), fname))
+    print()
+
+    result = run_docker(DOCKER_IMAGE, mounts, patch_cmd)
+    if result.returncode != 0:
+        die("patch_blend_paths failed (exit {})".format(result.returncode))
+
+    # Step 2: render from the patched copy
+    frame_start = args.frame_start if args.frame_start is not None else scene.get("frame_start", 0)
+    frame_end = args.frame_end if args.frame_end is not None else scene.get("frame_end")
+    if frame_end is None:
+        die("Could not determine frame_end from recipe. Use --frame-end.")
+
+    container_output = "/work/output/{}".format(os.path.basename(final_output))
+
+    render_cmd = [
+        "blender",
+        "--background", patched_blend,
+        "--python", "/scripts/render_vse.py",
+        "--",
+        "--output", container_output,
+        "--frame-start", str(int(frame_start)),
+        "--frame-end", str(int(frame_end)),
+        "--format", out_format,
+        "--video-codec", args.video_codec or str(out.get("video_codec", "libx264")),
+        "--crf", str(args.crf if args.crf is not None else out.get("crf", 18)),
+        "--audio-codec", args.audio_codec or str(out.get("audio_codec", "aac")),
+        "--audio-bitrate", args.audio_bitrate or str(out.get("audio_bitrate", "320k")),
+    ]
+
+    if args.resolution:
+        render_cmd += ["--resolution", args.resolution]
+    elif out.get("resolution_x") and out.get("resolution_y"):
+        render_cmd += ["--resolution", "{}x{}".format(
+            int(out["resolution_x"]), int(out["resolution_y"]))]
+
+    if out.get("fps"):
+        render_cmd += ["--fps", str(out["fps"])]
+
+    print("Step 2: Rendering...")
+    print("  Frames {}-{}  ({} total)".format(
+        frame_start, frame_end, int(frame_end) - int(frame_start) + 1))
+    print("  Output: {}".format(final_output))
+    print()
+
+    result = run_docker(DOCKER_IMAGE, mounts, render_cmd)
+    if result.returncode != 0:
+        die("render failed (exit {})".format(result.returncode))
+
+    if not os.path.exists(final_output):
+        die("Render completed but output file not found: {}\n"
+            "Check Blender output above for errors.".format(final_output))
+
+    size_gb = os.path.getsize(final_output) / (1024 ** 3)
+    # Clean up scratch dir
+    import shutil
+    shutil.rmtree(scratch_dir, ignore_errors=True)
+
+    print("\nDone. Output written to: {} ({:.2f} GB)".format(final_output, size_gb))
+
+
 def parse_conform_plan_minimal(plan_path):
     """
     Extract what cmd_conform needs from a conform plan without a YAML parser.
@@ -971,6 +1249,28 @@ def main():
                          metavar="<0.0-1.0>",
                          help="Minimum anchor match rate for a file to be suitable (default: 0.85)")
     p_match.set_defaults(func=cmd_match)
+
+    # cook
+    p_cook = sub.add_parser(
+        "cook",
+        help="Render the final output by patching and rendering the .blend file in Docker",
+    )
+    p_cook.add_argument("blend_file", metavar="<blend_file>")
+    p_cook.add_argument("recipe", metavar="<recipe.yaml>")
+    p_cook.add_argument("--work-dir", default="./grey17_work",
+                        metavar="<dir>",
+                        help="Directory containing conformed files (default: ./grey17_work/)")
+    p_cook.add_argument("--output", default=None, metavar="<output_file>",
+                        help="Path for final rendered file (default: ./grey17_output/<stem>.<format>)")
+    p_cook.add_argument("--format", default=None, metavar="<mkv|mp4|mov>")
+    p_cook.add_argument("--video-codec", default=None, metavar="<codec>")
+    p_cook.add_argument("--crf", type=int, default=None, metavar="<0-51>")
+    p_cook.add_argument("--audio-codec", default=None, metavar="<codec>")
+    p_cook.add_argument("--audio-bitrate", default=None, metavar="<e.g. 320k>")
+    p_cook.add_argument("--resolution", default=None, metavar="<WxH>")
+    p_cook.add_argument("--frame-start", type=int, default=None, metavar="<frame>")
+    p_cook.add_argument("--frame-end", type=int, default=None, metavar="<frame>")
+    p_cook.set_defaults(func=cmd_cook)
 
     # conform
     p_conform = sub.add_parser(

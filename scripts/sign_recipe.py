@@ -545,7 +545,8 @@ def main():
 
     # Write updated recipe
     with open(args.recipe, "w") as f:
-        yaml.dump(recipe, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        yaml.dump(recipe, f, default_flow_style=False, allow_unicode=True,
+                  sort_keys=False, width=99999)
 
     print("\nRecipe signed and written to: {}".format(args.recipe), flush=True)
 
