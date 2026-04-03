@@ -58,7 +58,9 @@ def run_docker(image, mounts, command, capture_stdout=False):
 
     Returns subprocess.CompletedProcess.
     """
-    cmd = ["docker", "run", "--rm"]
+    uid = os.getuid()
+    gid = os.getgid()
+    cmd = ["docker", "run", "--rm", "--user", "{}:{}".format(uid, gid)]
     for host_path, container_path, mode in mounts:
         cmd += ["-v", "{}:{}:{}".format(os.path.abspath(host_path), container_path, mode)]
     cmd += [image] + command
