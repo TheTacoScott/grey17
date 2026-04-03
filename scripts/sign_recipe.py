@@ -201,20 +201,27 @@ def extract_frames_batch(source_path, timecodes_1s, frames_dir):
     return mapping
 
 
-DENSE_FPS = 4.0  # frames per second for phash_sequence (cross-correlation signal)
+# Start/end sequence parameters
+SEQ_FRACTION = 0.10   # capture first/last 10% of video duration
+SEQ_FLOOR    = 1000   # minimum frames per sequence
+SEQ_CEIL     = 10000  # maximum frames per sequence
 
 
-def extract_phash_sequence(source_path, duration_seconds, dense_fps, frames_dir):
+def extract_endpoint_sequence(source_path, fps, start_tc, duration_secs, seq_dir):
     """
-    Extract frames at dense_fps and compute pHash for each.
-    Returns dict with keys: interval, start, phashes (list of hex strings).
-    The list index maps to timecode: tc = start + index * (1/dense_fps).
+    Extract frames at native fps for a window starting at start_tc for duration_secs.
+    Returns dict: {start_tc, fps, phashes} or None on failure.
+    phashes[i] corresponds to tc = start_tc + i / fps.
     """
-    seq_dir = os.path.join(frames_dir, "dense")
     os.makedirs(seq_dir, exist_ok=True)
     cmd = [
-        "ffmpeg", "-i", source_path,
-        "-vf", "fps={:.6f},scale=32:32:flags=lanczos,format=gray".format(dense_fps),
+        "ffmpeg",
+        "-ss", "{:.6f}".format(start_tc),
+        "-i", source_path,
+        "-t", "{:.6f}".format(duration_secs),
+        "-vf", "scale=32:32:flags=lanczos,format=gray",
+        "-vsync", "cfr",
+        "-r", "{:.6f}".format(fps),
         "-f", "image2",
         os.path.join(seq_dir, "f_%08d.png"),
         "-hide_banner", "-loglevel", "error",
@@ -222,10 +229,9 @@ def extract_phash_sequence(source_path, duration_seconds, dense_fps, frames_dir)
     ]
     result = subprocess.run(cmd)
     if result.returncode != 0:
-        print("WARNING: dense frame extraction failed, skipping phash_sequence", file=sys.stderr)
+        print("WARNING: endpoint frame extraction failed", file=sys.stderr)
         return None
 
-    interval = round(1.0 / dense_fps, 9)
     phashes = []
     for fname in sorted(os.listdir(seq_dir)):
         if not fname.startswith("f_") or not fname.endswith(".png"):
@@ -236,9 +242,19 @@ def extract_phash_sequence(source_path, duration_seconds, dense_fps, frames_dir)
     if not phashes:
         return None
 
-    print("  Dense phash sequence: {} frames at {}fps".format(len(phashes), dense_fps),
-          flush=True)
-    return {"interval": interval, "start": 0.0, "phashes": phashes}
+    return {"start_tc": round(start_tc, 6), "fps": round(fps, 6), "phashes": phashes}
+
+
+def compute_sequence_window(duration_seconds, native_fps):
+    """
+    Compute how many seconds to capture for a start/end sequence, and the
+    resulting frame count. Respects SEQ_FLOOR and SEQ_CEIL.
+    Returns (window_seconds, frame_count).
+    """
+    target_frames = int(duration_seconds * SEQ_FRACTION * native_fps)
+    target_frames = max(SEQ_FLOOR, min(SEQ_CEIL, target_frames))
+    window_seconds = target_frames / native_fps
+    return window_seconds, target_frames
 
 
 def extract_frame_seek(source_path, timecode, out_path):
@@ -532,9 +548,26 @@ def sign_source(source, source_path, anchor_interval, work_dir):
     interval_frame_map = extract_frames_batch(source_path, None, frames_dir)
     print("  Extracted {} interval frames".format(len(interval_frame_map)), flush=True)
 
-    # --- Dense phash sequence at DENSE_FPS for cross-correlation matching ---
-    print("  Extracting dense phash sequence ({}fps)...".format(DENSE_FPS), flush=True)
-    phash_sequence = extract_phash_sequence(source_path, duration, DENSE_FPS, frames_dir)
+    # --- Start/end endpoint sequences at native fps for sliding window matching ---
+    native_fps = meta.get("fps") or 24.0
+    window_secs, n_frames = compute_sequence_window(duration, native_fps)
+
+    print("  Extracting start sequence ({} frames, {:.1f}s at {:.3f}fps)...".format(
+        n_frames, window_secs, native_fps), flush=True)
+    start_seq = extract_endpoint_sequence(
+        source_path, native_fps,
+        start_tc=0.0, duration_secs=window_secs,
+        seq_dir=os.path.join(frames_dir, "start_seq"),
+    )
+
+    end_start_tc = max(0.0, duration - window_secs)
+    print("  Extracting end sequence ({} frames, {:.1f}s at {:.3f}fps)...".format(
+        n_frames, window_secs, native_fps), flush=True)
+    end_seq = extract_endpoint_sequence(
+        source_path, native_fps,
+        start_tc=end_start_tc, duration_secs=window_secs,
+        seq_dir=os.path.join(frames_dir, "end_seq"),
+    )
 
     # --- Audio: batch fpcalc per-second fingerprints ---
     print("  Computing audio fingerprints (fpcalc batch)...", flush=True)
@@ -591,7 +624,6 @@ def sign_source(source, source_path, anchor_interval, work_dir):
                 i + 1, total, seek_count, fpcalc_seek_count), flush=True)
 
     # Extract native-fps cut sequences for strip_in/strip_out anchors
-    native_fps = meta.get("fps") or 24.0
     cut_anchors = [a for a in anchors if a["role"] in ("strip_in", "strip_out")]
     if cut_anchors:
         print("  Extracting cut sequences for {} cut anchors (fps={:.3f})...".format(
@@ -607,7 +639,7 @@ def sign_source(source, source_path, anchor_interval, work_dir):
         n_seq = sum(1 for a in cut_anchors if "cut_sequence" in a)
         print("  Cut sequences extracted: {}".format(n_seq), flush=True)
 
-    return meta, anchors, phash_sequence
+    return meta, anchors, start_seq, end_seq
 
 # ---------------------------------------------------------------------------
 # Main
@@ -635,7 +667,7 @@ def main():
 
         print("\nSigning {} ({})".format(slot_id, os.path.basename(source_path)), flush=True)
         try:
-            meta, anchors, phash_sequence = sign_source(
+            meta, anchors, start_seq, end_seq = sign_source(
                 source, source_path,
                 args.anchor_interval, work_dir,
             )
@@ -664,10 +696,12 @@ def main():
         orig["audio_channels"] = meta["audio_channels"]
         orig["audio_sample_rate"] = meta["audio_sample_rate"]
         source["anchors"] = anchors
-        if phash_sequence:
-            source["phash_sequence"] = phash_sequence
-            print("  {} dense phash frames written for {}".format(
-                len(phash_sequence["phashes"]), slot_id), flush=True)
+        if start_seq:
+            source["start_sequence"] = start_seq
+            print("  Start sequence: {} frames".format(len(start_seq["phashes"])), flush=True)
+        if end_seq:
+            source["end_sequence"] = end_seq
+            print("  End sequence: {} frames".format(len(end_seq["phashes"])), flush=True)
         print("  {} anchors written for {}".format(len(anchors), slot_id), flush=True)
 
     recipe["signed"] = True
