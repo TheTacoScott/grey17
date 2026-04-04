@@ -1,0 +1,164 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "grey17 Recipe",
+  "description": "Fan edit recipe produced by grey17 generate-recipe and signed by grey17 sign-recipe.",
+  "type": "object",
+  "required": ["grey17_version", "recipe_version", "signed", "created_at", "metadata", "blender", "scene", "output", "sources"],
+  "additionalProperties": false,
+  "properties": {
+    "grey17_version": {
+      "type": ["string", "integer"],
+      "description": "Format version of the grey17 toolchain that wrote this file."
+    },
+    "recipe_version": {
+      "type": "string",
+      "description": "Recipe schema version."
+    },
+    "signed": {
+      "type": "boolean",
+      "description": "True after sign-recipe has run and populated anchor data."
+    },
+    "created_at": {
+      "type": "string",
+      "description": "ISO 8601 UTC timestamp when generate-recipe produced this file."
+    },
+    "metadata": {
+      "type": "object",
+      "required": ["title", "author", "blend_file"],
+      "additionalProperties": false,
+      "properties": {
+        "title":      { "type": "string" },
+        "author":     { "type": "string" },
+        "blend_file": { "type": "string" }
+      }
+    },
+    "blender": {
+      "type": "object",
+      "required": ["version", "version_tuple"],
+      "additionalProperties": false,
+      "properties": {
+        "version":       { "type": "string" },
+        "version_tuple": {
+          "type": "array",
+          "items": { "type": "integer" },
+          "minItems": 3,
+          "maxItems": 3
+        }
+      }
+    },
+    "scene": {
+      "type": "object",
+      "required": ["fps", "fps_base", "effective_fps", "frame_start", "frame_end", "duration_seconds", "resolution_x", "resolution_y"],
+      "additionalProperties": false,
+      "properties": {
+        "fps":              { "type": "number" },
+        "fps_base":         { "type": "number" },
+        "effective_fps":    { "type": "number" },
+        "frame_start":      { "type": "integer" },
+        "frame_end":        { "type": "integer" },
+        "duration_seconds": { "type": "number" },
+        "resolution_x":     { "type": "integer" },
+        "resolution_y":     { "type": "integer" }
+      }
+    },
+    "output": {
+      "type": "object",
+      "required": ["format", "video_codec", "crf", "audio_codec", "audio_bitrate", "resolution_x", "resolution_y", "fps"],
+      "additionalProperties": false,
+      "properties": {
+        "format":        { "type": "string" },
+        "video_codec":   { "type": "string" },
+        "crf":           { "type": "integer" },
+        "audio_codec":   { "type": "string" },
+        "audio_bitrate": { "type": "string" },
+        "resolution_x":  { "type": "integer" },
+        "resolution_y":  { "type": "integer" },
+        "fps":           { "type": "number" }
+      }
+    },
+    "sources": {
+      "type": "array",
+      "description": "One entry per source slot defined in the .blend VSE timeline.",
+      "items": { "$ref": "#/definitions/source" }
+    }
+  },
+  "definitions": {
+    "anchor": {
+      "type": "object",
+      "description": "A single frame's perceptual hashes. Frame position is implicit from array index.",
+      "required": ["phash", "ahash"],
+      "additionalProperties": false,
+      "properties": {
+        "phash": {
+          "type": "string",
+          "description": "64-bit DCT perceptual hash as a 16-char hex string."
+        },
+        "ahash": {
+          "type": "string",
+          "description": "64-bit average hash as a 16-char hex string."
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "required": ["id", "name", "description", "required", "expect_full_frame", "original"],
+      "additionalProperties": false,
+      "properties": {
+        "id":                { "type": "string" },
+        "name":              { "type": "string" },
+        "description":       { "type": "string" },
+        "required":          { "type": "boolean" },
+        "expect_full_frame": { "type": "boolean" },
+        "original":          { "$ref": "#/definitions/original" },
+        "start_anchors": {
+          "type": "array",
+          "description": "Dense pHash/aHash sequence for the first portion of the source at native fps. Anchor i corresponds to t = i / original.fps.",
+          "items": { "$ref": "#/definitions/anchor" },
+          "minItems": 1
+        },
+        "end_anchors": {
+          "type": "array",
+          "description": "Dense pHash/aHash sequence for the last portion of the source at native fps. Anchor 0 corresponds to t = original.duration_seconds - len(end_anchors) / original.fps.",
+          "items": { "$ref": "#/definitions/anchor" },
+          "minItems": 1
+        }
+      }
+    },
+    "original": {
+      "type": "object",
+      "required": ["filename", "filepath_on_author_machine"],
+      "additionalProperties": false,
+      "properties": {
+        "filename":                   { "type": "string" },
+        "filepath_on_author_machine": { "type": "string" },
+        "file_size_bytes":            { "type": ["integer", "null"] },
+        "file_exists_at_sign_time":   { "type": "boolean" },
+        "resolution_x":               { "type": ["integer", "null"] },
+        "resolution_y":               { "type": ["integer", "null"] },
+        "fps":                        { "type": ["number", "null"] },
+        "duration_seconds":           { "type": ["number", "null"] },
+        "duration_frames":            { "type": ["integer", "null"] },
+        "video_codec":                { "type": ["string", "null"] },
+        "audio_codec":                { "type": ["string", "null"] },
+        "audio_channels":             { "type": ["integer", "null"] },
+        "audio_sample_rate":          { "type": ["string", "null"] },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA256 hex digest of the source file, populated by sign-recipe."
+        },
+        "detected_crop": { "$ref": "#/definitions/crop_rect" }
+      }
+    },
+    "crop_rect": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "w": { "type": "integer" },
+        "h": { "type": "integer" },
+        "x": { "type": "integer" },
+        "y": { "type": "integer" }
+      }
+    }
+  }
+}

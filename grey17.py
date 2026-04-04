@@ -183,24 +183,6 @@ def manifest_to_recipe(manifest, blend_path, title, author, blend_dir_host=None)
 
     fps = scene["fps"] / scene["fps_base"]
 
-    def strip_timecodes_for_source(source_id):
-        """Compute strip in/out timecodes for a source from the manifest."""
-        seen = {}
-        for strip in manifest.get("strips", []):
-            if strip.get("source_id") != source_id:
-                continue
-            if strip["type"] not in ("MOVIE", "SOUND"):
-                continue
-            in_frame = strip["frame_offset_start"]
-            dur_frames = strip["frame_final_duration"]
-            out_frame = in_frame + dur_frames
-            in_tc = round(in_frame / fps, 6)
-            out_tc = round(out_frame / fps, 6)
-            for tc, role in [(in_tc, "strip_in"), (out_tc, "strip_out")]:
-                if tc not in seen:
-                    seen[tc] = {"timecode": tc, "role": role, "strip": strip["name"]}
-        return sorted(seen.values(), key=lambda x: x["timecode"])
-
     sources = []
     for src in manifest["sources"]:
         sources.append({
@@ -229,10 +211,7 @@ def manifest_to_recipe(manifest, blend_path, title, author, blend_dir_host=None)
                 "audio_channels": None,
                 "audio_sample_rate": None,
             },
-            # anchors populated by sign-recipe
-            "anchors": [],
-            # strip in/out timecodes - used by sign-recipe to place critical anchors
-            "strip_timecodes": strip_timecodes_for_source(src["id"]),
+            # start_anchors and end_anchors populated by sign-recipe
         })
 
     recipe = {
@@ -394,6 +373,7 @@ def cmd_generate_recipe(args):
         f.write(yaml_str)
 
     print_recipe_summary(recipe, output_path)
+    _run_validate_recipe(output_path)
 
 
 def cmd_inspect(args):
@@ -443,6 +423,70 @@ def cmd_inspect(args):
         print("Manifest written to: {}".format(output))
     else:
         print(json.dumps(data, indent=2))
+
+
+def cmd_validate_recipe(args):
+    recipe_path = os.path.abspath(args.recipe)
+    if not os.path.exists(recipe_path):
+        die("Recipe file not found: {}".format(recipe_path))
+
+    schema_path = os.path.abspath(
+        args.schema if args.schema else os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema", "recipe.schema.json")
+    )
+    if not os.path.exists(schema_path):
+        die("Schema file not found: {}".format(schema_path))
+
+    ensure_image()
+
+    recipe_dir = os.path.dirname(recipe_path)
+    recipe_filename = os.path.basename(recipe_path)
+    schema_dir = os.path.dirname(schema_path)
+    schema_filename = os.path.basename(schema_path)
+
+    mounts = [
+        (recipe_dir, "/work/recipe", "ro"),
+        (schema_dir, "/work/schema", "ro"),
+        (SCRIPTS_DIR, "/scripts", "ro"),
+    ]
+
+    validate_cmd = [
+        "python3", "/scripts/validate_recipe.py",
+        "--recipe", "/work/recipe/{}".format(recipe_filename),
+        "--schema", "/work/schema/{}".format(schema_filename),
+    ]
+
+    result = run_docker(DOCKER_IMAGE, mounts, validate_cmd)
+    if result.returncode != 0:
+        die("Recipe validation failed.")
+
+
+def _run_validate_recipe(recipe_path):
+    """Internal helper: run schema validation on a recipe file, print a warning on failure."""
+    schema_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema", "recipe.schema.json")
+    if not os.path.exists(schema_path):
+        return  # schema not present, skip silently
+
+    recipe_dir = os.path.dirname(os.path.abspath(recipe_path))
+    recipe_filename = os.path.basename(recipe_path)
+    schema_dir = os.path.dirname(schema_path)
+    schema_filename = os.path.basename(schema_path)
+
+    mounts = [
+        (recipe_dir, "/work/recipe", "ro"),
+        (schema_dir, "/work/schema", "ro"),
+        (SCRIPTS_DIR, "/scripts", "ro"),
+    ]
+
+    validate_cmd = [
+        "python3", "/scripts/validate_recipe.py",
+        "--recipe", "/work/recipe/{}".format(recipe_filename),
+        "--schema", "/work/schema/{}".format(schema_filename),
+    ]
+
+    result = run_docker(DOCKER_IMAGE, mounts, validate_cmd)
+    if result.returncode != 0:
+        print("\nWARNING: Recipe does not fully validate against schema. "
+              "Run 'python grey17.py validate-recipe {}' for details.".format(recipe_path))
 
 # ---------------------------------------------------------------------------
 # Recipe reader (stdlib only - no PyYAML on host)
@@ -640,7 +684,6 @@ def cmd_sign_recipe(args):
             "--seq-fraction", str(args.seq_fraction),
             "--seq-floor", str(args.seq_floor),
             "--seq-ceil", str(args.seq_ceil),
-            "--anchor-interval", str(args.anchor_interval),
         ]
 
         # Mount each source and add --source arg
@@ -659,6 +702,7 @@ def cmd_sign_recipe(args):
             die("sign-recipe failed (exit {})".format(result.returncode))
 
     print("\nDone. Recipe is signed and ready to share.")
+    _run_validate_recipe(recipe_path)
 
 
 def cmd_match(args):
@@ -1249,10 +1293,6 @@ def main():
     p_sign.add_argument("--seq-ceil", type=int, default=10000,
                         metavar="<frames>",
                         help="Maximum frames per endpoint sequence (default: 10000).")
-    p_sign.add_argument("--anchor-interval", type=float, default=1.0,
-                        metavar="<seconds>",
-                        help="Seconds between 1fps interval anchors (default: 1.0). "
-                             "Used only for Phase 4 frame-precise cut refinement, not primary matching.")
     p_sign.add_argument("--force", action="store_true",
                         help="Re-sign even if recipe is already signed")
     p_sign.set_defaults(func=cmd_sign_recipe)
@@ -1323,6 +1363,16 @@ def main():
     p_inspect.add_argument("blend_file", metavar="<blend_file>")
     p_inspect.add_argument("--output", metavar="<manifest.json>", default=None)
     p_inspect.set_defaults(func=cmd_inspect)
+
+    # validate-recipe
+    p_validate = sub.add_parser(
+        "validate-recipe",
+        help="Validate a recipe.yaml against the JSON schema spec",
+    )
+    p_validate.add_argument("recipe", metavar="<recipe.yaml>")
+    p_validate.add_argument("--schema", default=None, metavar="<recipe.schema.json>",
+                            help="Path to schema file (default: schema/recipe.schema.json in project dir)")
+    p_validate.set_defaults(func=cmd_validate_recipe)
 
     args = parser.parse_args()
     args.func(args)
