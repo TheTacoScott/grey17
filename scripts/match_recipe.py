@@ -47,9 +47,9 @@ def parse_args():
                    metavar="<0.0-1.0>",
                    help="Fraction of viewer duration to search at each end (default: 0.25). "
                         "Increase if the viewer has long pre-roll or extended credits.")
-    p.add_argument("--probe-frames", type=int, default=120,
+    p.add_argument("--probe-frames", type=int, default=500,
                    metavar="<frames>",
-                   help="Sliding window probe size in frames (default: 120 = ~5s at 24fps).")
+                   help="Sliding window probe size in frames (default: 500 = ~21s at 24fps).")
     p.add_argument("--work-dir", default="/work/tmp")
     return p.parse_args()
 
@@ -68,8 +68,11 @@ def parse_slot_args(slot_args):
 # ---------------------------------------------------------------------------
 
 VIEWER_SEARCH_FRACTION_DEFAULT = 0.25
-PROBE_FRAMES_DEFAULT = 120
-PROBE_SKIP_FRAMES = 24  # skip first ~1s to avoid fade-in black
+PROBE_FRAMES_DEFAULT = 500
+# Early exit: only stop probing early when the match is truly outstanding.
+# A mean_dist this low means the probe frames are essentially identical to
+# what's in the viewer - no point checking further windows.
+PROBE_EARLY_EXIT_DIST = 0.5
 
 
 def extract_viewer_endpoint_frames(viewer_path, start_tc, duration_secs, fps, seq_dir, crop=None):
@@ -143,6 +146,60 @@ def sliding_window_search(probe, search):
     return best_pos, best_score
 
 
+def _search_probe_windows(anchors, search_frames, fps, search_start_tc, anchor_base_tc,
+                          probe_frames, from_end, label):
+    """
+    Try up to PROBE_MAX_WINDOWS overlapping probe windows from the anchor sequence.
+    Each window is probe_frames wide; windows are spaced probe_frames//2 apart.
+
+    from_end=False: windows start at 0, stride forward (used for start anchors).
+    from_end=True:  windows start at the tail of anchors, stride backward (end anchors).
+
+    anchor_base_tc is the author-source timecode of anchors[0].
+    search_start_tc is the viewer timecode of search_frames[0].
+
+    Returns dict {viewer_tc, author_tc, score} for the best window found.
+    """
+    n = len(anchors)
+    stride = max(1, probe_frames // 2)
+    best = {"viewer_tc": search_start_tc, "author_tc": anchor_base_tc, "score": 64.0}
+
+    attempt = 0
+    while True:
+        if from_end:
+            win_end = n - attempt * stride
+            win_start = win_end - probe_frames
+        else:
+            win_start = attempt * stride
+            win_end = win_start + probe_frames
+
+        if win_start < 0 or win_end > n:
+            break
+
+        probe = anchors[win_start:win_end]
+        author_tc = anchor_base_tc + win_start / fps
+
+        pos, score = sliding_window_search(probe, search_frames)
+        viewer_tc = search_start_tc + pos / fps
+
+        is_best = score < best["score"]
+        if is_best:
+            best = {"viewer_tc": viewer_tc, "author_tc": author_tc, "score": score}
+
+        print("  {} window {}: author={:.1f}s  viewer={:.3f}s  dist={:.2f}{}".format(
+            label, attempt, author_tc, viewer_tc, score, " *" if is_best else ""),
+            flush=True)
+
+        if best["score"] <= PROBE_EARLY_EXIT_DIST:
+            break
+
+        attempt += 1
+
+    print("  {} best: viewer={:.3f}s  author={:.1f}s  dist={:.2f}".format(
+        label, best["viewer_tc"], best["author_tc"], best["score"]), flush=True)
+    return best
+
+
 def endpoint_match(source, viewer_path, viewer_duration, work_dir,
                    search_fraction=VIEWER_SEARCH_FRACTION_DEFAULT,
                    probe_frames=PROBE_FRAMES_DEFAULT,
@@ -150,12 +207,12 @@ def endpoint_match(source, viewer_path, viewer_duration, work_dir,
     """
     Find where the author's start and end anchors appear in the viewer file.
 
-    Uses fps from source["original"]["fps"] and derives anchor timecodes implicitly:
-      start_anchors[0] corresponds to t=0.0 in the author's source
-      end_anchors[0] corresponds to t=(duration - len(end_anchors)/fps)
+    Tries up to PROBE_MAX_WINDOWS overlapping probe windows (stride = probe_frames//2)
+    from each end of the signed anchor sequence. For each window the full sliding window
+    search runs against the viewer search region. The window with the lowest mean_dist
+    is used; search stops early if mean_dist drops below PROBE_EARLY_EXIT_DIST.
 
-    viewer_crop: optional {w, h, x, y} crop applied to viewer frames before hashing,
-    to strip pillarbox/letterbox bars that would otherwise distort the phash comparison.
+    viewer_crop: optional {w, h, x, y} applied before scaling to strip black bars.
 
     Returns dict with start_match_tc, end_match_tc, start_score, end_score,
     author_start_tc, author_end_tc. Or None if anchors are missing.
@@ -169,28 +226,9 @@ def endpoint_match(source, viewer_path, viewer_duration, work_dir,
     fps = orig.get("fps") or 24.0
     author_duration = orig.get("duration_seconds") or viewer_duration
     slot_id = source["id"]
-
-    # Build probes, skipping initial frames to avoid fade-in black at the start
-    skip = min(PROBE_SKIP_FRAMES, len(start_anchors) // 4)
-    start_probe = start_anchors[skip: skip + probe_frames]
-
-    # End probe: take probe_frames from near the end, leaving skip frames at the tail
-    end_tail = max(0, len(end_anchors) - skip)
-    end_probe_start = max(0, end_tail - probe_frames)
-    end_probe = end_anchors[end_probe_start: end_tail]
-    if not end_probe:
-        end_probe = end_anchors[-probe_frames:]
-
-    # Author timecodes for the probe windows
-    author_start_tc = skip / fps
-
-    # end_anchors starts at: author_duration - len(end_anchors)/fps
-    end_anchors_start_tc = max(0.0, author_duration - len(end_anchors) / fps)
-    author_end_tc = end_anchors_start_tc + end_probe_start / fps
-
     search_duration = viewer_duration * search_fraction
 
-    # -- Start search: first search_fraction of viewer --
+    # -- Start: extract viewer search frames, then try probe windows forward --
     print("  Extracting viewer start search region ({:.0f}s)...".format(
         search_duration), flush=True)
     start_search = extract_viewer_endpoint_frames(
@@ -201,14 +239,16 @@ def endpoint_match(source, viewer_path, viewer_duration, work_dir,
     if not start_search:
         return None
 
-    print("  Sliding window search (start): {} probe vs {} viewer frames...".format(
-        len(start_probe), len(start_search)), flush=True)
-    start_pos, start_score = sliding_window_search(start_probe, start_search)
-    viewer_start_tc = start_pos / fps
-    print("  Start match: viewer_tc={:.3f}s  mean_dist={:.2f}".format(
-        viewer_start_tc, start_score), flush=True)
+    best_start = _search_probe_windows(
+        start_anchors, start_search, fps,
+        search_start_tc=0.0,
+        anchor_base_tc=0.0,
+        probe_frames=probe_frames,
+        from_end=False,
+        label="start",
+    )
 
-    # -- End search: last search_fraction of viewer --
+    # -- End: extract viewer search frames, then try probe windows backward from tail --
     end_search_start = max(0.0, viewer_duration - search_duration)
     print("  Extracting viewer end search region ({:.0f}s from {:.0f}s)...".format(
         search_duration, end_search_start), flush=True)
@@ -220,20 +260,25 @@ def endpoint_match(source, viewer_path, viewer_duration, work_dir,
     if not end_search:
         return None
 
-    print("  Sliding window search (end): {} probe vs {} viewer frames...".format(
-        len(end_probe), len(end_search)), flush=True)
-    end_pos, end_score = sliding_window_search(end_probe, end_search)
-    viewer_end_tc = end_search_start + end_pos / fps
-    print("  End match: viewer_tc={:.3f}s  mean_dist={:.2f}".format(
-        viewer_end_tc, end_score), flush=True)
+    # end_anchors[0] corresponds to this timecode in the author's source
+    end_anchors_base_tc = max(0.0, author_duration - len(end_anchors) / fps)
+
+    best_end = _search_probe_windows(
+        end_anchors, end_search, fps,
+        search_start_tc=end_search_start,
+        anchor_base_tc=end_anchors_base_tc,
+        probe_frames=probe_frames,
+        from_end=True,
+        label="end",
+    )
 
     return {
-        "start_match_tc": viewer_start_tc,
-        "end_match_tc": viewer_end_tc,
-        "start_score": round(start_score, 4),
-        "end_score": round(end_score, 4),
-        "author_start_tc": author_start_tc,
-        "author_end_tc": author_end_tc,
+        "start_match_tc": best_start["viewer_tc"],
+        "end_match_tc":   best_end["viewer_tc"],
+        "start_score":    round(best_start["score"], 4),
+        "end_score":      round(best_end["score"],   4),
+        "author_start_tc": best_start["author_tc"],
+        "author_end_tc":   best_end["author_tc"],
     }
 
 # ---------------------------------------------------------------------------

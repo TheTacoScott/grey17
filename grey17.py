@@ -1317,9 +1317,9 @@ def main():
                          metavar="<0.0-1.0>",
                          help="Fraction of viewer to search at each end (default: 0.25). "
                               "Increase if viewer has very long pre-roll or extended credits.")
-    p_match.add_argument("--probe-frames", type=int, default=120,
+    p_match.add_argument("--probe-frames", type=int, default=500,
                          metavar="<frames>",
-                         help="Sliding window probe size in frames (default: 120 = ~5s at 24fps).")
+                         help="Sliding window probe size in frames (default: 500 = ~21s at 24fps).")
     p_match.set_defaults(func=cmd_match)
 
     # cook
