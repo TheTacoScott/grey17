@@ -211,7 +211,7 @@ def manifest_to_recipe(manifest, blend_path, title, author, blend_dir_host=None)
                 "audio_channels": None,
                 "audio_sample_rate": None,
             },
-            # start_anchors and end_anchors populated by sign-recipe
+            # phash_sequence and audio fingerprints populated by sign-recipe
         })
 
     recipe = {
@@ -681,9 +681,6 @@ def cmd_sign_recipe(args):
             "python3", "/scripts/sign_recipe.py",
             "--recipe", "/work/recipe/{}".format(recipe_filename),
             "--work-dir", "/work/tmp",
-            "--seq-fraction", str(args.seq_fraction),
-            "--seq-floor", str(args.seq_floor),
-            "--seq-ceil", str(args.seq_ceil),
         ]
 
         # Mount each source and add --source arg
@@ -1282,17 +1279,6 @@ def main():
     p_sign.add_argument("--search-dir", action="append", default=[],
                         metavar="<dir>",
                         help="Directory to search for source files by filename (repeatable)")
-    p_sign.add_argument("--seq-fraction", type=float, default=0.10,
-                        metavar="<0.0-1.0>",
-                        help="Fraction of video to capture at each end for endpoint sequences "
-                             "(default: 0.10 = first and last 10%%). Increase for short videos "
-                             "or when content near the ends is unreliable.")
-    p_sign.add_argument("--seq-floor", type=int, default=1000,
-                        metavar="<frames>",
-                        help="Minimum frames per endpoint sequence (default: 1000).")
-    p_sign.add_argument("--seq-ceil", type=int, default=10000,
-                        metavar="<frames>",
-                        help="Maximum frames per endpoint sequence (default: 10000).")
     p_sign.add_argument("--force", action="store_true",
                         help="Re-sign even if recipe is already signed")
     p_sign.set_defaults(func=cmd_sign_recipe)

@@ -12,16 +12,15 @@ Usage:
 """
 import argparse
 import os
-import shutil
 import subprocess
 import sys
 import datetime
 
 import yaml
-from PIL import Image
-import imagehash
 
 from utils import compute_sha256, ffprobe_source, phash_distance, detect_crop
+from utils import extract_phashes_pipe
+
 
 # ---------------------------------------------------------------------------
 # Args
@@ -64,67 +63,46 @@ def parse_slot_args(slot_args):
     return mapping
 
 # ---------------------------------------------------------------------------
-# Sliding window endpoint matching
+# Constants
 # ---------------------------------------------------------------------------
 
 VIEWER_SEARCH_FRACTION_DEFAULT = 0.25
 PROBE_FRAMES_DEFAULT = 500
-# Early exit: only stop probing early when the match is truly outstanding.
-# A mean_dist this low means the probe frames are essentially identical to
-# what's in the viewer - no point checking further windows.
+# Only exit the probe window retry early when the match is nearly perfect.
 PROBE_EARLY_EXIT_DIST = 0.5
 
+# Sub-frame refinement: try +-SUBFRAME_STEPS * (1/fps / SUBFRAME_STEPS) offsets.
+# With SUBFRAME_STEPS=10, this is +-1 frame in 0.1-frame increments (21 candidates).
+SUBFRAME_STEPS = 10
+SUBFRAME_COMPARE_FRAMES = 50  # frames compared per candidate (fast)
 
-def extract_viewer_endpoint_frames(viewer_path, start_tc, duration_secs, fps, seq_dir, crop=None):
+# ---------------------------------------------------------------------------
+# Viewer frame extraction
+# ---------------------------------------------------------------------------
+
+def extract_viewer_endpoint_frames(viewer_path, start_tc, duration_secs, fps, crop=None):
     """
     Extract viewer frames at the given fps for a search window.
     If crop is a dict {w, h, x, y}, it is applied before scaling to strip black bars.
-    Returns list of {phash, ahash} dicts (one per frame), or empty list on failure.
+    Returns list of pHash hex strings (one per frame), or empty list on failure.
+
+    Uses extract_phashes_pipe from utils for rawvideo pipe extraction.
     """
-    os.makedirs(seq_dir, exist_ok=True)
-    if crop:
-        vf = "crop={w}:{h}:{x}:{y},scale=32:32:flags=lanczos,format=gray".format(**crop)
-    else:
-        vf = "scale=32:32:flags=lanczos,format=gray"
-    cmd = [
-        "ffmpeg",
-        "-ss", "{:.6f}".format(start_tc),
-        "-i", viewer_path,
-        "-t", "{:.6f}".format(duration_secs),
-        "-vf", vf,
-        "-vsync", "cfr",
-        "-r", "{:.6f}".format(fps),
-        "-f", "image2",
-        os.path.join(seq_dir, "f_%08d.png"),
-        "-hide_banner", "-loglevel", "error",
-        "-y",
-    ]
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        print("  WARNING: viewer frame extraction failed", file=sys.stderr)
-        return []
+    n_frames = int(duration_secs * fps) + 2  # slight over-request; pipe stops at EOF anyway
+    hashes = extract_phashes_pipe(viewer_path, start_tc, fps, crop=crop, n_frames=n_frames)
+    if not hashes:
+        print("  WARNING: viewer frame extraction produced no frames", file=sys.stderr)
+    return hashes
 
-    anchors = []
-    for fname in sorted(os.listdir(seq_dir)):
-        if not fname.startswith("f_") or not fname.endswith(".png"):
-            continue
-        try:
-            img = Image.open(os.path.join(seq_dir, fname)).convert("L")
-            anchors.append({
-                "phash": str(imagehash.phash(img)),
-                "ahash": str(imagehash.average_hash(img)),
-            })
-        except Exception:
-            anchors.append({"phash": "0" * 16, "ahash": "0" * 16})
-    return anchors
-
+# ---------------------------------------------------------------------------
+# Sliding window search
+# ---------------------------------------------------------------------------
 
 def sliding_window_search(probe, search):
     """
-    Slide probe (list of {phash, ahash}) over search (list of {phash, ahash}).
+    Slide probe (list of pHash hex strings) over search (list of pHash hex strings).
     Score at each position = mean pHash Hamming distance (lower = better).
     Returns (best_position_index, best_mean_distance).
-    best_position_index is the index into search where probe[0] best aligns.
     """
     n_probe = len(probe)
     n_search = len(search)
@@ -136,8 +114,7 @@ def sliding_window_search(probe, search):
     best_score = 64.0
 
     for i in range(n_search - n_probe + 1):
-        total = sum(phash_distance(probe[j]["phash"], search[i + j]["phash"])
-                    for j in range(n_probe))
+        total = sum(phash_distance(probe[j], search[i + j]) for j in range(n_probe))
         mean_dist = total / n_probe
         if mean_dist < best_score:
             best_score = mean_dist
@@ -149,20 +126,28 @@ def sliding_window_search(probe, search):
 def _search_probe_windows(anchors, search_frames, fps, search_start_tc, anchor_base_tc,
                           probe_frames, from_end, label):
     """
-    Try up to PROBE_MAX_WINDOWS overlapping probe windows from the anchor sequence.
+    Exhaustively try all overlapping probe windows from the anchor sequence.
+    anchors and search_frames are lists of pHash hex strings.
     Each window is probe_frames wide; windows are spaced probe_frames//2 apart.
 
-    from_end=False: windows start at 0, stride forward (used for start anchors).
-    from_end=True:  windows start at the tail of anchors, stride backward (end anchors).
+    from_end=False: windows start at 0, stride forward (start anchors).
+    from_end=True:  windows start at the tail, stride backward (end anchors).
 
     anchor_base_tc is the author-source timecode of anchors[0].
     search_start_tc is the viewer timecode of search_frames[0].
 
-    Returns dict {viewer_tc, author_tc, score} for the best window found.
+    Returns dict {viewer_tc, author_tc, score, probe} for the best window found.
+    probe is the list of pHash strings for the winning window (used for sub-frame
+    refinement).
     """
     n = len(anchors)
     stride = max(1, probe_frames // 2)
-    best = {"viewer_tc": search_start_tc, "author_tc": anchor_base_tc, "score": 64.0}
+    best = {
+        "viewer_tc": search_start_tc,
+        "author_tc": anchor_base_tc,
+        "score": 64.0,
+        "probe": [],
+    }
 
     attempt = 0
     while True:
@@ -184,7 +169,12 @@ def _search_probe_windows(anchors, search_frames, fps, search_start_tc, anchor_b
 
         is_best = score < best["score"]
         if is_best:
-            best = {"viewer_tc": viewer_tc, "author_tc": author_tc, "score": score}
+            best = {
+                "viewer_tc": viewer_tc,
+                "author_tc": author_tc,
+                "score": score,
+                "probe": probe,
+            }
 
         print("  {} window {}: author={:.1f}s  viewer={:.3f}s  dist={:.2f}{}".format(
             label, attempt, author_tc, viewer_tc, score, " *" if is_best else ""),
@@ -199,43 +189,88 @@ def _search_probe_windows(anchors, search_frames, fps, search_start_tc, anchor_b
         label, best["viewer_tc"], best["author_tc"], best["score"]), flush=True)
     return best
 
+# ---------------------------------------------------------------------------
+# Sub-frame refinement
+# ---------------------------------------------------------------------------
 
-def endpoint_match(source, viewer_path, viewer_duration, work_dir,
+def subframe_refine(viewer_path, coarse_viewer_tc, probe_hashes, fps, crop=None):
+    """
+    Refine coarse_viewer_tc by trying +-1 frame in 0.1-frame steps (21 candidates).
+    Uses SUBFRAME_COMPARE_FRAMES frames per candidate for speed.
+    probe_hashes: list of pHash strings from the winning coarse probe window.
+    Returns (refined_viewer_tc, refined_score).
+    """
+    n = min(SUBFRAME_COMPARE_FRAMES, len(probe_hashes))
+    probe = probe_hashes[:n]
+
+    step_secs = 1.0 / (fps * SUBFRAME_STEPS)  # 0.1-frame step in seconds
+    best_tc = coarse_viewer_tc
+    best_score = 64.0
+
+    for i in range(-SUBFRAME_STEPS, SUBFRAME_STEPS + 1):
+        candidate_tc = max(0.0, coarse_viewer_tc + i * step_secs)
+        frames = extract_phashes_pipe(viewer_path, candidate_tc, fps, crop=crop, n_frames=n)
+        if len(frames) < n:
+            continue
+        total = sum(phash_distance(probe[j], frames[j]) for j in range(n))
+        score = total / n
+        if score < best_score:
+            best_score = score
+            best_tc = candidate_tc
+
+    return best_tc, best_score
+
+# ---------------------------------------------------------------------------
+# Endpoint matching (visual pHash)
+# ---------------------------------------------------------------------------
+
+def endpoint_match(source, viewer_path, viewer_duration,
                    search_fraction=VIEWER_SEARCH_FRACTION_DEFAULT,
                    probe_frames=PROBE_FRAMES_DEFAULT,
                    viewer_crop=None):
     """
     Find where the author's start and end anchors appear in the viewer file.
 
-    Tries up to PROBE_MAX_WINDOWS overlapping probe windows (stride = probe_frames//2)
-    from each end of the signed anchor sequence. For each window the full sliding window
-    search runs against the viewer search region. The window with the lowest mean_dist
-    is used; search stops early if mean_dist drops below PROBE_EARLY_EXIT_DIST.
-
-    viewer_crop: optional {w, h, x, y} applied before scaling to strip black bars.
+    Supports two recipe formats:
+      phash_sequence  (new): list of pHash hex strings covering the entire video.
+                             Split at midpoint: first half -> start search,
+                             second half -> end search.
+      start_anchors / end_anchors (legacy): separate lists of {phash, ahash} dicts
+                             or plain strings.
 
     Returns dict with start_match_tc, end_match_tc, start_score, end_score,
-    author_start_tc, author_end_tc. Or None if anchors are missing.
+    author_start_tc, author_end_tc. Or None if no anchor data is present.
     """
-    start_anchors = source.get("start_anchors")
-    end_anchors = source.get("end_anchors")
-    if not start_anchors or not end_anchors:
-        return None
-
     orig = source.get("original") or {}
     fps = orig.get("fps") or 24.0
     author_duration = orig.get("duration_seconds") or viewer_duration
-    slot_id = source["id"]
     search_duration = viewer_duration * search_fraction
 
-    # -- Start: extract viewer search frames, then try probe windows forward --
+    # Resolve anchor lists from recipe (plain string lists)
+    phash_seq = source.get("phash_sequence")
+    if phash_seq:
+        # New format: list of pHash strings for entire video
+        n_total = len(phash_seq)
+        half = n_total // 2
+        start_anchors = phash_seq[:half]
+        end_anchors = phash_seq[half:]
+        end_anchors_base_tc = half / fps
+    else:
+        # Legacy format: {phash, ahash} dicts or plain strings
+        raw_start = source.get("start_anchors") or []
+        raw_end   = source.get("end_anchors") or []
+        if not raw_start or not raw_end:
+            return None
+        # Normalize to plain strings
+        start_anchors = [a["phash"] if isinstance(a, dict) else a for a in raw_start]
+        end_anchors   = [a["phash"] if isinstance(a, dict) else a for a in raw_end]
+        end_anchors_base_tc = max(0.0, author_duration - len(end_anchors) / fps)
+
+    # -- Start: extract viewer search frames, then probe windows forward --
     print("  Extracting viewer start search region ({:.0f}s)...".format(
         search_duration), flush=True)
     start_search = extract_viewer_endpoint_frames(
-        viewer_path, 0.0, search_duration, fps,
-        os.path.join(work_dir, "{}_start_search".format(slot_id)),
-        crop=viewer_crop,
-    )
+        viewer_path, 0.0, search_duration, fps, crop=viewer_crop)
     if not start_search:
         return None
 
@@ -248,20 +283,26 @@ def endpoint_match(source, viewer_path, viewer_duration, work_dir,
         label="start",
     )
 
-    # -- End: extract viewer search frames, then try probe windows backward from tail --
+    # Sub-frame refinement for start endpoint
+    if best_start["probe"] and best_start["score"] < 20.0:
+        print("  Sub-frame refining start...", flush=True)
+        refined_tc, refined_score = subframe_refine(
+            viewer_path, best_start["viewer_tc"], best_start["probe"], fps, crop=viewer_crop)
+        if refined_tc != best_start["viewer_tc"]:
+            print("  start sub-frame: {:.6f}s -> {:.6f}s  dist {:.2f} -> {:.2f}".format(
+                best_start["viewer_tc"], refined_tc, best_start["score"], refined_score),
+                flush=True)
+            best_start["viewer_tc"] = refined_tc
+            best_start["score"] = refined_score
+
+    # -- End: extract viewer search frames, then probe windows backward from tail --
     end_search_start = max(0.0, viewer_duration - search_duration)
     print("  Extracting viewer end search region ({:.0f}s from {:.0f}s)...".format(
         search_duration, end_search_start), flush=True)
     end_search = extract_viewer_endpoint_frames(
-        viewer_path, end_search_start, search_duration, fps,
-        os.path.join(work_dir, "{}_end_search".format(slot_id)),
-        crop=viewer_crop,
-    )
+        viewer_path, end_search_start, search_duration, fps, crop=viewer_crop)
     if not end_search:
         return None
-
-    # end_anchors[0] corresponds to this timecode in the author's source
-    end_anchors_base_tc = max(0.0, author_duration - len(end_anchors) / fps)
 
     best_end = _search_probe_windows(
         end_anchors, end_search, fps,
@@ -272,6 +313,18 @@ def endpoint_match(source, viewer_path, viewer_duration, work_dir,
         label="end",
     )
 
+    # Sub-frame refinement for end endpoint
+    if best_end["probe"] and best_end["score"] < 20.0:
+        print("  Sub-frame refining end...", flush=True)
+        refined_tc, refined_score = subframe_refine(
+            viewer_path, best_end["viewer_tc"], best_end["probe"], fps, crop=viewer_crop)
+        if refined_tc != best_end["viewer_tc"]:
+            print("  end sub-frame: {:.6f}s -> {:.6f}s  dist {:.2f} -> {:.2f}".format(
+                best_end["viewer_tc"], refined_tc, best_end["score"], refined_score),
+                flush=True)
+            best_end["viewer_tc"] = refined_tc
+            best_end["score"] = refined_score
+
     return {
         "start_match_tc": best_start["viewer_tc"],
         "end_match_tc":   best_end["viewer_tc"],
@@ -280,6 +333,10 @@ def endpoint_match(source, viewer_path, viewer_duration, work_dir,
         "author_start_tc": best_start["author_tc"],
         "author_end_tc":   best_end["author_tc"],
     }
+
+# ---------------------------------------------------------------------------
+# Audio fingerprint matching
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Trim computation
@@ -310,7 +367,7 @@ def compute_trim_points(source, offset, speed_factor, viewer_duration):
 # Main match loop
 # ---------------------------------------------------------------------------
 
-def match_slot(source, viewer_path, viewer_info, work_dir, threshold,
+def match_slot(source, viewer_path, viewer_info, threshold,
                search_fraction=VIEWER_SEARCH_FRACTION_DEFAULT,
                probe_frames=PROBE_FRAMES_DEFAULT):
     """
@@ -351,14 +408,15 @@ def match_slot(source, viewer_path, viewer_info, work_dir, threshold,
             }
         print("  SHA256 mismatch - proceeding with fingerprint matching.", flush=True)
 
-    if not source.get("start_anchors") or not source.get("end_anchors"):
-        print("  ERROR: recipe has no start/end anchors for {}. Re-sign the recipe.".format(slot_id),
-              file=sys.stderr)
+    has_phash_seq = bool(source.get("phash_sequence"))
+    has_legacy_anchors = bool(source.get("start_anchors") and source.get("end_anchors"))
+    if not has_phash_seq and not has_legacy_anchors:
+        print("  ERROR: recipe has no phash_sequence or start/end anchors for {}. "
+              "Re-sign the recipe.".format(slot_id), file=sys.stderr)
         return {"slot_id": slot_id, "status": "no_match", "match_rate": 0.0}
 
     # Detect crop before matching so bars are stripped from viewer frames.
-    # Only done when the recipe marks this source as full-frame: if the author's
-    # signed anchors include bars, cropping the viewer would break the comparison.
+    # Only done when the recipe marks this source as full-frame.
     viewer_crop = None
     if source.get("expect_full_frame"):
         print("  Detecting viewer crop...", flush=True)
@@ -366,11 +424,13 @@ def match_slot(source, viewer_path, viewer_info, work_dir, threshold,
                                   viewer_info["resolution_x"], viewer_info["resolution_y"])
         if viewer_crop:
             print("  Crop detected: {}x{} at ({},{}) - applying during matching.".format(
-                viewer_crop["w"], viewer_crop["h"], viewer_crop["x"], viewer_crop["y"]), flush=True)
+                viewer_crop["w"], viewer_crop["h"], viewer_crop["x"], viewer_crop["y"]),
+                flush=True)
         else:
             print("  No crop detected.", flush=True)
 
-    ep = endpoint_match(source, viewer_path, viewer_duration, work_dir,
+    # -- Visual endpoint match --
+    ep = endpoint_match(source, viewer_path, viewer_duration,
                         search_fraction=search_fraction,
                         probe_frames=probe_frames,
                         viewer_crop=viewer_crop)
@@ -382,26 +442,28 @@ def match_slot(source, viewer_path, viewer_info, work_dir, threshold,
     viewer_span = ep["end_match_tc"] - ep["start_match_tc"]
 
     if author_span > 0 and viewer_span > 0:
-        final_speed = viewer_span / author_span
+        visual_speed = viewer_span / author_span
     else:
-        final_speed = 1.0
-    final_speed = max(0.90, min(1.10, final_speed))
+        visual_speed = 1.0
+    visual_speed = max(0.90, min(1.10, visual_speed))
 
-    final_offset = ep["start_match_tc"] - ep["author_start_tc"] * final_speed
+    visual_offset = ep["start_match_tc"] - ep["author_start_tc"] * visual_speed
 
     start_quality = max(0.0, 1.0 - ep["start_score"] / 32.0)
     end_quality   = max(0.0, 1.0 - ep["end_score"]   / 32.0)
-    match_rate = (start_quality + end_quality) / 2.0
+    visual_match_rate = (start_quality + end_quality) / 2.0
 
     print("  Endpoint match: offset={:.3f}s  speed={:.6f}  match_rate={:.1%}".format(
-        final_offset, final_speed, match_rate), flush=True)
+        visual_offset, visual_speed, visual_match_rate), flush=True)
 
-    suitable = match_rate >= threshold
-    trim = compute_trim_points(source, final_offset, final_speed, viewer_duration)
+    suitable = visual_match_rate >= threshold
+    match_method = "visual" if has_phash_seq else "endpoint"
+
+    trim = compute_trim_points(source, visual_offset, visual_speed, viewer_duration)
 
     transform = {
-        "offset_seconds": round(final_offset, 6),
-        "speed_factor": round(final_speed, 8),
+        "offset_seconds": round(visual_offset, 6),
+        "speed_factor": round(visual_speed, 8),
         "trim_start_seconds": trim["trim_start_seconds"],
         "trim_duration_seconds": trim["trim_duration_seconds"],
         "fps_in": viewer_info["fps"],
@@ -417,8 +479,10 @@ def match_slot(source, viewer_path, viewer_info, work_dir, threshold,
         "slot_id": slot_id,
         "slot_name": source.get("name", ""),
         "status": "suitable" if suitable else "unsuitable",
-        "match_rate": round(match_rate, 4),
-        "match_method": "endpoint",
+        "match_rate": round(visual_match_rate, 4),
+        "match_method": match_method,
+        "start_score": ep["start_score"],
+        "end_score": ep["end_score"],
         "input_file": viewer_path,
         "transform": transform,
         "output_filename": orig.get("filename", "{}_conformed.mkv".format(slot_id)),
@@ -434,9 +498,6 @@ def main():
 
     with open(args.recipe) as f:
         recipe = yaml.safe_load(f)
-
-    work_dir = os.path.abspath(args.work_dir)
-    os.makedirs(work_dir, exist_ok=True)
 
     results = []
     all_suitable = True
@@ -469,10 +530,12 @@ def main():
                 viewer_info["video_codec"] or "?",
             ), flush=True)
 
-            result = match_slot(source, viewer_path, viewer_info, work_dir, args.threshold,
+            result = match_slot(source, viewer_path, viewer_info, args.threshold,
                                 search_fraction=args.search_fraction,
                                 probe_frames=args.probe_frames)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             print("  ERROR: {}".format(e), file=sys.stderr)
             result = {"slot_id": slot_id, "status": "error", "error": str(e)}
 
@@ -486,9 +549,6 @@ def main():
         else:
             results.append({"slot_id": slot_id, "status": "error"})
             all_suitable = False
-
-    # Clean up work dir
-    shutil.rmtree(work_dir, ignore_errors=True)
 
     # Write conform plan
     conform_plan = {

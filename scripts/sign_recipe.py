@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """
 Runs inside Docker container (system Python 3).
-Generates fingerprint anchor points for all source files listed in a recipe.
+Generates fingerprint data for all source files listed in a recipe.
+
+Signing produces:
+  phash_sequence  - concatenated 16-char hex pHash strings for every frame of
+                    the source, at native fps. One string covering the entire
+                    video. Length = num_frames * 16 characters.
+  audio_start_fp  - raw Chromaprint integers for the first AUDIO_WINDOW_SECS
+                    of audio (list of ints).
+  audio_end_fp    - raw Chromaprint integers for the last AUDIO_WINDOW_SECS.
 
 Usage:
     python3 sign_recipe.py \
@@ -16,7 +24,14 @@ import sys
 
 import yaml
 
-from utils import compute_sha256, ffprobe_source, detect_crop, hash_frame
+from utils import compute_sha256, ffprobe_source, detect_crop, extract_phashes_pipe, run_fpcalc
+
+# ---------------------------------------------------------------------------
+# Audio fingerprint constants
+# ---------------------------------------------------------------------------
+
+# Seconds of audio to capture at each end of the source.
+AUDIO_WINDOW_SECS = 300.0
 
 # ---------------------------------------------------------------------------
 # Args
@@ -26,24 +41,16 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Fingerprint source videos and write anchor data into a recipe.",
         epilog=(
-            "Captures dense pHash/aHash sequences for the first and last portion of each "
-            "source at native fps. These start_anchors and end_anchors are used by "
-            "'grey17 match' for sliding window endpoint alignment."
+            "Hashes every frame of each source at native fps (phash_sequence) and "
+            "captures Chromaprint audio fingerprints for the first and last "
+            "{:.0f}s. These are used by 'grey17 match' for sliding window "
+            "endpoint alignment.".format(AUDIO_WINDOW_SECS)
         ),
     )
     p.add_argument("--recipe", required=True, help="Path to recipe.yaml (read/write)")
-    p.add_argument("--work-dir", default="/work/tmp", help="Writable scratch directory")
+    p.add_argument("--work-dir", default="/work/tmp", help="Writable scratch directory (reserved)")
     p.add_argument("--source", action="append", default=[], metavar="slot_id=/path/to/file",
                    help="Map a source slot to a file (repeatable)")
-    p.add_argument("--seq-fraction", type=float, default=0.10,
-                   metavar="<0.0-1.0>",
-                   help="Fraction of video to capture at each end (default: 0.10 = first/last 10%%).")
-    p.add_argument("--seq-floor", type=int, default=1000,
-                   metavar="<frames>",
-                   help="Minimum frames per endpoint sequence (default: 1000).")
-    p.add_argument("--seq-ceil", type=int, default=10000,
-                   metavar="<frames>",
-                   help="Maximum frames per endpoint sequence (default: 10000).")
     return p.parse_args()
 
 
@@ -59,77 +66,16 @@ def parse_source_args(source_args):
     return mapping
 
 # ---------------------------------------------------------------------------
-# Endpoint sequence
-# ---------------------------------------------------------------------------
-
-SEQ_FRACTION_DEFAULT = 0.10
-SEQ_FLOOR_DEFAULT    = 1000
-SEQ_CEIL_DEFAULT     = 10000
-
-
-def compute_sequence_window(duration_seconds, native_fps,
-                            seq_fraction=SEQ_FRACTION_DEFAULT,
-                            seq_floor=SEQ_FLOOR_DEFAULT,
-                            seq_ceil=SEQ_CEIL_DEFAULT):
-    """
-    Compute how many seconds to capture for a start/end sequence and the frame count.
-    Returns (window_seconds, frame_count).
-    """
-    target_frames = int(duration_seconds * seq_fraction * native_fps)
-    target_frames = max(seq_floor, min(seq_ceil, target_frames))
-    window_seconds = target_frames / native_fps
-    return window_seconds, target_frames
-
-
-def extract_endpoint_anchors(source_path, fps, start_tc, duration_secs, seq_dir):
-    """
-    Extract frames at native fps for a window starting at start_tc for duration_secs.
-    Returns a list of {phash, ahash} dicts (one per frame), or None on failure.
-    Frame 0 corresponds to start_tc; frame i corresponds to start_tc + i/fps.
-    """
-    os.makedirs(seq_dir, exist_ok=True)
-    cmd = [
-        "ffmpeg",
-        "-ss", "{:.6f}".format(start_tc),
-        "-i", source_path,
-        "-t", "{:.6f}".format(duration_secs),
-        "-vf", "scale=32:32:flags=lanczos,format=gray",
-        "-vsync", "cfr",
-        "-r", "{:.6f}".format(fps),
-        "-f", "image2",
-        os.path.join(seq_dir, "f_%08d.png"),
-        "-hide_banner", "-loglevel", "error",
-        "-y",
-    ]
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        print("WARNING: endpoint frame extraction failed", file=sys.stderr)
-        return None
-
-    anchors = []
-    for fname in sorted(os.listdir(seq_dir)):
-        if not fname.startswith("f_") or not fname.endswith(".png"):
-            continue
-        ph, ah = hash_frame(os.path.join(seq_dir, fname))
-        anchors.append({"phash": ph, "ahash": ah})
-
-    if not anchors:
-        return None
-
-    return anchors
-
-# ---------------------------------------------------------------------------
 # Per-source signing
 # ---------------------------------------------------------------------------
 
-def sign_source(source, source_path, work_dir,
-                seq_fraction=SEQ_FRACTION_DEFAULT,
-                seq_floor=SEQ_FLOOR_DEFAULT,
-                seq_ceil=SEQ_CEIL_DEFAULT):
+def sign_source(source, source_path):
     """
     Sign a single source file.
-    Returns (source_metadata, start_anchors, end_anchors).
-    start_anchors and end_anchors are lists of {phash, ahash} dicts.
+    Returns (meta, phash_sequence, audio_start_fp, audio_end_fp).
+
+    phash_sequence is a concatenated hex string of every frame's pHash.
+    audio_start_fp and audio_end_fp are lists of Chromaprint ints.
     """
     source_id = source["id"]
 
@@ -164,28 +110,45 @@ def sign_source(source, source_path, work_dir,
         print("  No black bars detected: source appears full-frame.", flush=True)
 
     native_fps = meta.get("fps") or 24.0
-    frames_dir = os.path.join(work_dir, "{}_frames".format(source_id))
-    window_secs, n_frames = compute_sequence_window(duration, native_fps,
-                                                     seq_fraction, seq_floor, seq_ceil)
+    n_expected = int(duration * native_fps)
 
-    print("  Extracting start anchors ({} frames, {:.1f}s at {:.3f}fps)...".format(
-        n_frames, window_secs, native_fps), flush=True)
-    start_anchors = extract_endpoint_anchors(
-        source_path, native_fps,
-        start_tc=0.0, duration_secs=window_secs,
-        seq_dir=os.path.join(frames_dir, "start"),
-    )
+    print("  Extracting pHash for all {} frames at {:.3f}fps...".format(
+        n_expected, native_fps), flush=True)
 
-    end_start_tc = max(0.0, duration - window_secs)
-    print("  Extracting end anchors ({} frames, {:.1f}s at {:.3f}fps)...".format(
-        n_frames, window_secs, native_fps), flush=True)
-    end_anchors = extract_endpoint_anchors(
-        source_path, native_fps,
-        start_tc=end_start_tc, duration_secs=window_secs,
-        seq_dir=os.path.join(frames_dir, "end"),
-    )
+    def progress(n):
+        print("  ... {} / ~{} frames ({:.1f}s / {:.1f}s)...".format(
+            n, n_expected, n / native_fps, duration), flush=True)
 
-    return meta, start_anchors, end_anchors
+    hashes = extract_phashes_pipe(source_path, 0.0, native_fps,
+                                  progress_callback=progress)
+    if not hashes:
+        raise RuntimeError("pHash extraction produced no frames for {}".format(source_path))
+
+    phash_sequence = hashes  # list of 16-char hex pHash strings, one per frame
+    print("  pHash complete: {} frames".format(len(phash_sequence)), flush=True)
+
+    # Audio fingerprints
+    print("  Extracting audio fingerprint (start {:.0f}s)...".format(
+        AUDIO_WINDOW_SECS), flush=True)
+    audio_start_fp = run_fpcalc(source_path, 0.0, AUDIO_WINDOW_SECS)
+    if audio_start_fp:
+        print("  audio_start_fp: {} ints ({:.1f}s)".format(
+            len(audio_start_fp), len(audio_start_fp) / 86.0), flush=True)
+    else:
+        print("  WARNING: audio_start_fp extraction failed (fpcalc missing or audio absent?)",
+              flush=True)
+
+    end_audio_offset = max(0.0, duration - AUDIO_WINDOW_SECS)
+    print("  Extracting audio fingerprint (end {:.0f}s from {:.1f}s)...".format(
+        AUDIO_WINDOW_SECS, end_audio_offset), flush=True)
+    audio_end_fp = run_fpcalc(source_path, end_audio_offset, AUDIO_WINDOW_SECS)
+    if audio_end_fp:
+        print("  audio_end_fp: {} ints ({:.1f}s)".format(
+            len(audio_end_fp), len(audio_end_fp) / 86.0), flush=True)
+    else:
+        print("  WARNING: audio_end_fp extraction failed", flush=True)
+
+    return meta, phash_sequence, audio_start_fp, audio_end_fp
 
 # ---------------------------------------------------------------------------
 # Main
@@ -197,9 +160,6 @@ def main():
 
     with open(args.recipe) as f:
         recipe = yaml.safe_load(f)
-
-    work_dir = os.path.abspath(args.work_dir)
-    os.makedirs(work_dir, exist_ok=True)
 
     for source in recipe.get("sources", []):
         slot_id = source["id"]
@@ -213,12 +173,7 @@ def main():
 
         print("\nSigning {} ({})".format(slot_id, os.path.basename(source_path)), flush=True)
         try:
-            meta, start_anchors, end_anchors = sign_source(
-                source, source_path, work_dir,
-                seq_fraction=args.seq_fraction,
-                seq_floor=args.seq_floor,
-                seq_ceil=args.seq_ceil,
-            )
+            meta, phash_sequence, audio_start_fp, audio_end_fp = sign_source(source, source_path)
         except Exception as e:
             print("ERROR signing {}: {}".format(slot_id, e), file=sys.stderr)
             continue
@@ -239,25 +194,24 @@ def main():
         orig["audio_channels"] = meta["audio_channels"]
         orig["audio_sample_rate"] = meta["audio_sample_rate"]
 
-        if start_anchors:
-            source["start_anchors"] = start_anchors
-            print("  start_anchors: {} frames".format(len(start_anchors)), flush=True)
-        if end_anchors:
-            source["end_anchors"] = end_anchors
-            print("  end_anchors: {} frames".format(len(end_anchors)), flush=True)
+        source["phash_sequence"] = phash_sequence
+        if audio_start_fp:
+            source["audio_start_fp"] = audio_start_fp
+        if audio_end_fp:
+            source["audio_end_fp"] = audio_end_fp
 
-        # Remove legacy fields if present from a previous sign run
-        for key in ("anchors", "start_sequence", "end_sequence", "strip_timecodes"):
+        # Remove fields from previous sign format
+        for key in ("anchors", "start_anchors", "end_anchors",
+                    "start_sequence", "end_sequence", "strip_timecodes"):
             source.pop(key, None)
 
-        print("  Done: {} start anchors, {} end anchors".format(
-            len(start_anchors) if start_anchors else 0,
-            len(end_anchors) if end_anchors else 0,
+        print("  Done: {} frames, {} audio start ints, {} audio end ints".format(
+            len(phash_sequence),
+            len(audio_start_fp) if audio_start_fp else 0,
+            len(audio_end_fp) if audio_end_fp else 0,
         ), flush=True)
 
     recipe["signed"] = True
-
-    shutil.rmtree(work_dir, ignore_errors=True)
 
     with open(args.recipe, "w") as f:
         yaml.dump(recipe, f, default_flow_style=False, allow_unicode=True,

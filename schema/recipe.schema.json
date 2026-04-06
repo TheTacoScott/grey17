@@ -11,12 +11,12 @@
       "description": "Format version of the grey17 toolchain that wrote this file."
     },
     "recipe_version": {
-      "type": "string",
+      "type": ["string", "number"],
       "description": "Recipe schema version."
     },
     "signed": {
       "type": "boolean",
-      "description": "True after sign-recipe has run and populated anchor data."
+      "description": "True after sign-recipe has run and populated fingerprint data."
     },
     "created_at": {
       "type": "string",
@@ -83,22 +83,6 @@
     }
   },
   "definitions": {
-    "anchor": {
-      "type": "object",
-      "description": "A single frame's perceptual hashes. Frame position is implicit from array index.",
-      "required": ["phash", "ahash"],
-      "additionalProperties": false,
-      "properties": {
-        "phash": {
-          "type": "string",
-          "description": "64-bit DCT perceptual hash as a 16-char hex string."
-        },
-        "ahash": {
-          "type": "string",
-          "description": "64-bit average hash as a 16-char hex string."
-        }
-      }
-    },
     "source": {
       "type": "object",
       "required": ["id", "name", "description", "required", "expect_full_frame", "original"],
@@ -110,17 +94,25 @@
         "required":          { "type": "boolean" },
         "expect_full_frame": { "type": "boolean" },
         "original":          { "$ref": "#/definitions/original" },
-        "start_anchors": {
+        "phash_sequence": {
           "type": "array",
-          "description": "Dense pHash/aHash sequence for the first portion of the source at native fps. Anchor i corresponds to t = i / original.fps.",
-          "items": { "$ref": "#/definitions/anchor" },
+          "description": "Dense pHash sequence for every frame of the source at native fps. phash_sequence[i] is a 16-char hex pHash string for frame i. Split at midpoint for start/end endpoint matching.",
+          "items": {
+            "type": "string",
+            "minLength": 16,
+            "maxLength": 16
+          },
           "minItems": 1
         },
-        "end_anchors": {
+        "audio_start_fp": {
           "type": "array",
-          "description": "Dense pHash/aHash sequence for the last portion of the source at native fps. Anchor 0 corresponds to t = original.duration_seconds - len(end_anchors) / original.fps.",
-          "items": { "$ref": "#/definitions/anchor" },
-          "minItems": 1
+          "description": "Raw Chromaprint fingerprint integers for the first portion of audio. Each integer is a 32-bit Chromaprint value.",
+          "items": { "type": "integer" }
+        },
+        "audio_end_fp": {
+          "type": "array",
+          "description": "Raw Chromaprint fingerprint integers for the last portion of audio.",
+          "items": { "type": "integer" }
         }
       }
     },

@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
     xz-utils \
     python3-pip \
     ffmpeg \
+    libchromaprint-tools \
     libxrender1 \
     libxxf86vm1 \
     libxfixes3 \

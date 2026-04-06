@@ -5,6 +5,7 @@ Imported by sign_recipe.py and match_recipe.py.
 """
 import hashlib
 import json
+import os
 import subprocess
 import sys
 
@@ -94,15 +95,129 @@ def phash_distance(h1, h2):
 
 def hash_frame(png_path):
     """
-    Compute perceptual hashes for a 32x32 grayscale PNG.
-    Returns (phash_str, ahash_str), or ("0"*16, "0"*16) on failure.
+    Compute perceptual hash for a 32x32 grayscale PNG.
+    Returns phash_str, or "0"*16 on failure.
     """
     try:
         img = Image.open(png_path).convert("L")
-        return str(imagehash.phash(img)), str(imagehash.average_hash(img))
+        return str(imagehash.phash(img))
     except Exception as e:
         print("WARNING: hash failed for {}: {}".format(png_path, e), file=sys.stderr)
-        return "0" * 16, "0" * 16
+        return "0" * 16
+
+# ---------------------------------------------------------------------------
+# Pipe-based frame extraction
+# ---------------------------------------------------------------------------
+
+def extract_phashes_pipe(video_path, start_tc, fps, crop=None, n_frames=None, progress_callback=None):
+    """
+    Extract frames via rawvideo pipe and return a list of pHash hex strings.
+    Each frame is scaled to 32x32 grayscale before hashing.
+
+    start_tc: seek to this timecode before extracting.
+    fps: extract at this frame rate.
+    crop: optional {w, h, x, y} applied before scaling to strip black bars.
+    n_frames: if set, stop after this many frames. If None, extract until EOF.
+    progress_callback: optional callable(n_hashed) invoked every 1000 frames.
+    """
+    FRAME_SIZE = 32 * 32
+
+    if crop:
+        vf = "crop={w}:{h}:{x}:{y},scale=32:32:flags=lanczos,format=gray".format(**crop)
+    else:
+        vf = "scale=32:32:flags=lanczos,format=gray"
+
+    cmd = [
+        "ffmpeg",
+        "-ss", "{:.6f}".format(start_tc),
+        "-i", video_path,
+    ]
+    if n_frames is not None:
+        cmd += ["-frames:v", str(n_frames)]
+    cmd += [
+        "-vf", vf,
+        "-vsync", "cfr",
+        "-r", "{:.6f}".format(fps),
+        "-f", "rawvideo", "-pix_fmt", "gray",
+        "pipe:1",
+        "-hide_banner", "-loglevel", "error",
+    ]
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    hashes = []
+    try:
+        while True:
+            chunk = proc.stdout.read(FRAME_SIZE)
+            if len(chunk) < FRAME_SIZE:
+                break
+            img = Image.frombytes("L", (32, 32), chunk)
+            hashes.append(str(imagehash.phash(img)))
+            if progress_callback and len(hashes) % 1000 == 0:
+                progress_callback(len(hashes))
+    finally:
+        proc.stdout.close()
+        proc.wait()
+
+    return hashes
+
+
+# ---------------------------------------------------------------------------
+# Chromaprint audio fingerprint
+# ---------------------------------------------------------------------------
+
+def run_fpcalc(path, offset_secs, duration_secs):
+    """
+    Extract a raw Chromaprint fingerprint for an audio window.
+    Uses ffmpeg to seek and extract the audio window to a temp FLAC file, then
+    runs fpcalc on that file. This approach works with older fpcalc versions that
+    do not support the -offset flag.
+
+    offset_secs: skip this many seconds from the start of the file.
+    duration_secs: extract this many seconds of audio.
+    Returns a list of 32-bit integers (Chromaprint values), or [] on failure.
+    """
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".flac", delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        # Extract audio window to a temporary FLAC file
+        extract_cmd = [
+            "ffmpeg",
+            "-ss", "{:.6f}".format(offset_secs),
+            "-i", path,
+            "-t", "{:.6f}".format(duration_secs),
+            "-vn",
+            tmp_path,
+            "-y", "-hide_banner", "-loglevel", "error",
+        ]
+        r = subprocess.run(extract_cmd)
+        if r.returncode != 0:
+            return []
+
+        # fpcalc default max is 120s; pass the actual duration to fingerprint everything
+        fpcalc_cmd = [
+            "fpcalc",
+            "-json", "-raw",
+            "-length", "{:.1f}".format(duration_secs + 5),
+            tmp_path,
+        ]
+        result = subprocess.run(fpcalc_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print("WARNING: fpcalc failed for {}: {}".format(
+                os.path.basename(path), result.stderr[:300]), file=sys.stderr)
+            return []
+        try:
+            data = json.loads(result.stdout)
+            return data.get("fingerprint", [])
+        except (json.JSONDecodeError, ValueError) as exc:
+            print("WARNING: fpcalc JSON parse error: {}".format(exc), file=sys.stderr)
+            return []
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
 
 # ---------------------------------------------------------------------------
 # Crop detection
