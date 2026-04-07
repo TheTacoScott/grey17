@@ -83,12 +83,19 @@ def ffprobe_source(path):
 # pHash
 # ---------------------------------------------------------------------------
 
+_POPCOUNT16 = [bin(i).count("1") for i in range(65536)]
+
+
 def phash_distance(h1, h2):
     """Hamming distance between two 16-char hex pHash strings. Returns 0-64."""
     if not h1 or not h2:
         return 64
     try:
-        return bin(int(h1, 16) ^ int(h2, 16)).count("1")
+        x = int(h1, 16) ^ int(h2, 16)
+        return (_POPCOUNT16[x & 0xFFFF] +
+                _POPCOUNT16[(x >> 16) & 0xFFFF] +
+                _POPCOUNT16[(x >> 32) & 0xFFFF] +
+                _POPCOUNT16[(x >> 48) & 0xFFFF])
     except ValueError:
         return 64
 

@@ -21,6 +21,8 @@ import yaml
 from utils import compute_sha256, ffprobe_source, phash_distance, detect_crop
 from utils import extract_phashes_pipe
 
+_POPCOUNT16 = [bin(i).count("1") for i in range(65536)]
+
 
 # ---------------------------------------------------------------------------
 # Args
@@ -70,6 +72,10 @@ VIEWER_SEARCH_FRACTION_DEFAULT = 0.25
 PROBE_FRAMES_DEFAULT = 500
 # Only exit the probe window retry early when the match is nearly perfect.
 PROBE_EARLY_EXIT_DIST = 0.5
+# Maximum number of probe windows per endpoint. When the anchor sequence is
+# long enough to require more windows, the stride is automatically widened so
+# that the windows are spread evenly across the full sequence.
+PROBE_MAX_WINDOWS = 48
 
 # Sub-frame refinement: try +-SUBFRAME_STEPS * (1/fps / SUBFRAME_STEPS) offsets.
 # With SUBFRAME_STEPS=10, this is +-1 frame in 0.1-frame increments (21 candidates).
@@ -103,6 +109,8 @@ def sliding_window_search(probe, search):
     Slide probe (list of pHash hex strings) over search (list of pHash hex strings).
     Score at each position = mean pHash Hamming distance (lower = better).
     Returns (best_position_index, best_mean_distance).
+
+    Preconverts all hex strings to ints once to avoid repeated int() calls.
     """
     n_probe = len(probe)
     n_search = len(search)
@@ -110,11 +118,19 @@ def sliding_window_search(probe, search):
     if n_probe == 0 or n_search < n_probe:
         return 0, 64.0
 
+    _PC = _POPCOUNT16  # local reference for speed
+    probe_ints  = [int(h, 16) for h in probe]
+    search_ints = [int(h, 16) for h in search]
+
     best_pos = 0
     best_score = 64.0
 
     for i in range(n_search - n_probe + 1):
-        total = sum(phash_distance(probe[j], search[i + j]) for j in range(n_probe))
+        total = 0
+        for j in range(n_probe):
+            x = probe_ints[j] ^ search_ints[i + j]
+            total += (_PC[x & 0xFFFF] + _PC[(x >> 16) & 0xFFFF] +
+                      _PC[(x >> 32) & 0xFFFF] + _PC[(x >> 48) & 0xFFFF])
         mean_dist = total / n_probe
         if mean_dist < best_score:
             best_score = mean_dist
@@ -141,7 +157,15 @@ def _search_probe_windows(anchors, search_frames, fps, search_start_tc, anchor_b
     refinement).
     """
     n = len(anchors)
-    stride = max(1, probe_frames // 2)
+    # Default stride is probe_frames//2 (half-overlap). For very long anchor
+    # sequences (full-video phash_sequence), widen the stride so we stay within
+    # PROBE_MAX_WINDOWS while still covering the full range.
+    default_stride = max(1, probe_frames // 2)
+    max_windows_at_default = max(1, (n - probe_frames) // default_stride + 1)
+    if max_windows_at_default <= PROBE_MAX_WINDOWS:
+        stride = default_stride
+    else:
+        stride = max(1, (n - probe_frames) // (PROBE_MAX_WINDOWS - 1))
     best = {
         "viewer_tc": search_start_tc,
         "author_tc": anchor_base_tc,
@@ -283,17 +307,16 @@ def endpoint_match(source, viewer_path, viewer_duration,
         label="start",
     )
 
-    # Sub-frame refinement for start endpoint
-    if best_start["probe"] and best_start["score"] < 20.0:
+    # Sub-frame refinement for start endpoint (TC only - score stays the coarse 500-frame value)
+    if best_start["probe"] and best_start["score"] < 5.0:
         print("  Sub-frame refining start...", flush=True)
         refined_tc, refined_score = subframe_refine(
             viewer_path, best_start["viewer_tc"], best_start["probe"], fps, crop=viewer_crop)
         if refined_tc != best_start["viewer_tc"]:
-            print("  start sub-frame: {:.6f}s -> {:.6f}s  dist {:.2f} -> {:.2f}".format(
-                best_start["viewer_tc"], refined_tc, best_start["score"], refined_score),
+            print("  start sub-frame: {:.6f}s -> {:.6f}s  (50-frame dist {:.2f})".format(
+                best_start["viewer_tc"], refined_tc, refined_score),
                 flush=True)
             best_start["viewer_tc"] = refined_tc
-            best_start["score"] = refined_score
 
     # -- End: extract viewer search frames, then probe windows backward from tail --
     end_search_start = max(0.0, viewer_duration - search_duration)
@@ -313,17 +336,16 @@ def endpoint_match(source, viewer_path, viewer_duration,
         label="end",
     )
 
-    # Sub-frame refinement for end endpoint
-    if best_end["probe"] and best_end["score"] < 20.0:
+    # Sub-frame refinement for end endpoint (TC only - score stays the coarse 500-frame value)
+    if best_end["probe"] and best_end["score"] < 5.0:
         print("  Sub-frame refining end...", flush=True)
         refined_tc, refined_score = subframe_refine(
             viewer_path, best_end["viewer_tc"], best_end["probe"], fps, crop=viewer_crop)
         if refined_tc != best_end["viewer_tc"]:
-            print("  end sub-frame: {:.6f}s -> {:.6f}s  dist {:.2f} -> {:.2f}".format(
-                best_end["viewer_tc"], refined_tc, best_end["score"], refined_score),
+            print("  end sub-frame: {:.6f}s -> {:.6f}s  (50-frame dist {:.2f})".format(
+                best_end["viewer_tc"], refined_tc, refined_score),
                 flush=True)
             best_end["viewer_tc"] = refined_tc
-            best_end["score"] = refined_score
 
     return {
         "start_match_tc": best_start["viewer_tc"],
