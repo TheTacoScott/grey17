@@ -72,9 +72,8 @@ VIEWER_SEARCH_FRACTION_DEFAULT = 0.25
 PROBE_FRAMES_DEFAULT = 500
 # Only exit the probe window retry early when the match is nearly perfect.
 PROBE_EARLY_EXIT_DIST = 0.5
-# Maximum number of probe windows per endpoint. When the anchor sequence is
-# long enough to require more windows, the stride is automatically widened so
-# that the windows are spread evenly across the full sequence.
+# Maximum number of probe windows per endpoint. Always uses stride=probe_frames//2
+# (half-overlap). Stops after this many windows regardless of sequence length.
 PROBE_MAX_WINDOWS = 48
 
 # Sub-frame refinement: try +-SUBFRAME_STEPS * (1/fps / SUBFRAME_STEPS) offsets.
@@ -157,15 +156,7 @@ def _search_probe_windows(anchors, search_frames, fps, search_start_tc, anchor_b
     refinement).
     """
     n = len(anchors)
-    # Default stride is probe_frames//2 (half-overlap). For very long anchor
-    # sequences (full-video phash_sequence), widen the stride so we stay within
-    # PROBE_MAX_WINDOWS while still covering the full range.
-    default_stride = max(1, probe_frames // 2)
-    max_windows_at_default = max(1, (n - probe_frames) // default_stride + 1)
-    if max_windows_at_default <= PROBE_MAX_WINDOWS:
-        stride = default_stride
-    else:
-        stride = max(1, (n - probe_frames) // (PROBE_MAX_WINDOWS - 1))
+    stride = max(1, probe_frames // 2)
     best = {
         "viewer_tc": search_start_tc,
         "author_tc": anchor_base_tc,
@@ -182,7 +173,7 @@ def _search_probe_windows(anchors, search_frames, fps, search_start_tc, anchor_b
             win_start = attempt * stride
             win_end = win_start + probe_frames
 
-        if win_start < 0 or win_end > n:
+        if win_start < 0 or win_end > n or attempt >= PROBE_MAX_WINDOWS:
             break
 
         probe = anchors[win_start:win_end]
