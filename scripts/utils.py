@@ -6,6 +6,7 @@ Imported by sign_recipe.py and match_recipe.py.
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -287,3 +288,85 @@ def detect_crop(source_path, duration, native_w, native_h):
         return None
 
     return {"w": w, "h": h, "x": x, "y": y}
+
+
+# ---------------------------------------------------------------------------
+# Commercial break detection
+# ---------------------------------------------------------------------------
+
+def detect_break_intervals(video_path, min_duration=0.5, black_threshold=0.01, silence_db=-60.0):
+    """
+    Detect commercial break candidates: segments that are both black and silent.
+
+    Runs ffmpeg blackdetect + silencedetect in a single pass over the full video.
+    A segment qualifies as a break when a black interval and a silence interval overlap
+    by at least half of min_duration seconds.
+
+    black_threshold: fraction of pixels allowed to be non-black (blackdetect pix_th).
+    silence_db: noise floor threshold in dB (silencedetect n, e.g. -60.0 -> "-60dB").
+    min_duration: minimum seconds of black/silence to consider (applied to both filters).
+
+    Returns a list of dicts with keys:
+        start_seconds, end_seconds, duration_seconds
+    Boundaries are taken from the black interval (video black is the canonical signal).
+    Returns [] if no breaks found or if the video has no audio stream.
+    """
+    cmd = [
+        "ffmpeg",
+        "-i", video_path,
+        "-vf", "blackdetect=d={:.3f}:pix_th={:.3f}".format(min_duration, black_threshold),
+        "-af", "silencedetect=n={:.0f}dB:d={:.3f}".format(silence_db, min_duration),
+        "-f", "null", "-",
+        "-hide_banner",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    stderr = result.stderr
+
+    # Parse black intervals from lines like:
+    # [blackdetect @ 0x...] black_start:30.031 black_end:35.368 black_duration:5.337
+    black_intervals = []
+    for line in stderr.splitlines():
+        if "black_start:" not in line:
+            continue
+        try:
+            bs = float(re.search(r"black_start:([\d.]+)", line).group(1))
+            be = float(re.search(r"black_end:([\d.]+)", line).group(1))
+            black_intervals.append((bs, be))
+        except (AttributeError, ValueError):
+            continue
+
+    # Parse silence intervals from paired lines like:
+    # [silencedetect @ 0x...] silence_start: 30.031
+    # [silencedetect @ 0x...] silence_end: 35.368 | silence_duration: 5.337
+    silence_starts = []
+    silence_ends = []
+    for line in stderr.splitlines():
+        m = re.search(r"silence_start:\s*([\d.]+)", line)
+        if m:
+            silence_starts.append(float(m.group(1)))
+            continue
+        m = re.search(r"silence_end:\s*([\d.]+)", line)
+        if m:
+            silence_ends.append(float(m.group(1)))
+
+    silence_intervals = list(zip(silence_starts, silence_ends))
+
+    if not black_intervals or not silence_intervals:
+        return []
+
+    # Keep black intervals that overlap sufficiently with any silence interval.
+    # Use the black interval's boundaries as the canonical break timecodes.
+    min_overlap = min_duration * 0.5
+    breaks = []
+    for bs, be in black_intervals:
+        for ss, se in silence_intervals:
+            overlap = min(be, se) - max(bs, ss)
+            if overlap >= min_overlap:
+                breaks.append({
+                    "start_seconds":    round(bs, 4),
+                    "end_seconds":      round(be, 4),
+                    "duration_seconds": round(be - bs, 4),
+                })
+                break
+
+    return breaks

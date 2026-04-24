@@ -1,9 +1,9 @@
-FROM ubuntu:20.04
+FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8
-ENV BLENDER_VERSION=2.91.0
+ENV BLENDER_VERSION=5.1.0
 ENV BLENDER_PATH=/usr/local/blender
 ENV PATH="${BLENDER_PATH}:${PATH}"
 
@@ -33,10 +33,10 @@ RUN pip3 install --no-cache-dir \
     jsonschema
 
 RUN wget -q \
-    https://mirror.clarkson.edu/blender/release/Blender2.91/blender-2.91.0-linux64.tar.xz \
-    && tar -xf blender-2.91.0-linux64.tar.xz \
-    && mv blender-2.91.0-linux64 ${BLENDER_PATH} \
-    && rm blender-2.91.0-linux64.tar.xz
+    https://download.blender.org/release/Blender5.1/blender-5.1.0-linux-x64.tar.xz \
+    && tar -xf blender-5.1.0-linux-x64.tar.xz \
+    && mv blender-5.1.0-linux-x64 ${BLENDER_PATH} \
+    && rm blender-5.1.0-linux-x64.tar.xz
 
 COPY scripts/ /scripts/
 

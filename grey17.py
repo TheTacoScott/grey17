@@ -15,7 +15,7 @@ import datetime
 # Constants
 # ---------------------------------------------------------------------------
 
-DOCKER_IMAGE = "grey17/blender:2.91"
+DOCKER_IMAGE = "grey17/blender:5.1"
 SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
 DOCKER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docker")
 
@@ -777,6 +777,8 @@ def cmd_match(args):
         "--search-fraction", str(args.search_fraction),
         "--probe-frames", str(args.probe_frames),
     ]
+    if args.no_dtw:
+        match_cmd.append("--no-dtw")
 
     for src in slots:
         sid = src["id"]
@@ -1231,6 +1233,69 @@ def cmd_conform(args):
 
     print("\nConformed files written to: {}".format(work_dir))
 
+
+# ---------------------------------------------------------------------------
+# cmd_verify_conform
+# ---------------------------------------------------------------------------
+
+def cmd_verify_conform(args):
+    recipe_path = os.path.abspath(args.recipe)
+    video_path  = os.path.abspath(args.video)
+
+    if not os.path.exists(recipe_path):
+        die("Recipe file not found: {}".format(recipe_path))
+    if not os.path.exists(video_path):
+        die("Conformed video not found: {}".format(video_path))
+
+    recipe_meta = parse_recipe_minimal(recipe_path)
+    if not recipe_meta.get("signed"):
+        die("Recipe has not been signed yet. Run sign-recipe first.")
+
+    recipe_dir      = os.path.dirname(recipe_path)
+    recipe_filename = os.path.basename(recipe_path)
+    video_filename  = os.path.basename(video_path)
+
+    output_path = os.path.abspath(args.output) if args.output else None
+    if output_path:
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        output_dir      = os.path.dirname(output_path)
+        output_filename = os.path.basename(output_path)
+    else:
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        output_dir      = os.path.join(project_root, "tmp")
+        output_filename = None
+
+    os.makedirs(output_dir, exist_ok=True)
+    ensure_image()
+
+    mounts = [
+        (recipe_dir,  "/work/recipe", "ro"),
+        (video_path,  "/work/video/{}".format(video_filename), "ro"),
+        (output_dir,  "/work/out", "rw"),
+        (SCRIPTS_DIR, "/scripts",  "ro"),
+    ]
+
+    verify_cmd = [
+        "python3", "/scripts/verify_conform.py",
+        "--recipe", "/work/recipe/{}".format(recipe_filename),
+        "--video",  "/work/video/{}".format(video_filename),
+        "--slot",   args.slot,
+        "--sample-rate", str(args.sample_rate),
+    ]
+    if output_filename:
+        verify_cmd += ["--output", "/work/out/{}".format(output_filename)]
+
+    print("Verifying conformed video against recipe...")
+    print("  Recipe: {}".format(recipe_filename))
+    print("  Video:  {}".format(video_filename))
+    print("  Slot:   {}".format(args.slot))
+    print()
+
+    result = run_docker(DOCKER_IMAGE, mounts, verify_cmd)
+    if result.returncode not in (0, 1):
+        die("verify-conform failed (exit {})".format(result.returncode))
+
+
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
@@ -1306,6 +1371,8 @@ def main():
     p_match.add_argument("--probe-frames", type=int, default=500,
                          metavar="<frames>",
                          help="Sliding window probe size in frames (default: 500 = ~21s at 24fps).")
+    p_match.add_argument("--no-dtw", action="store_true",
+                         help="Skip DTW refinement pass (faster, uses anchor LSQ fit only).")
     p_match.set_defaults(func=cmd_match)
 
     # cook
@@ -1340,6 +1407,24 @@ def main():
                            metavar="<dir>",
                            help="Directory to write conformed files into (default: ./grey17_work/)")
     p_conform.set_defaults(func=cmd_conform)
+
+    # verify-conform
+    p_verify = sub.add_parser(
+        "verify-conform",
+        help="Compare a conformed video frame-by-frame against the recipe phash_sequence",
+    )
+    p_verify.add_argument("recipe", metavar="<recipe.yaml>")
+    p_verify.add_argument("video",  metavar="<conformed_video>")
+    p_verify.add_argument("--slot", default="source_0",
+                          metavar="<slot_id>",
+                          help="Source slot to compare against (default: source_0)")
+    p_verify.add_argument("--sample-rate", type=int, default=1,
+                          metavar="<N>",
+                          help="Compare every Nth frame (default: 1 = every frame). "
+                               "Use 24 for fast ~1fps sampling.")
+    p_verify.add_argument("--output", default=None, metavar="<report.csv>",
+                          help="Path to write per-frame distance CSV (optional)")
+    p_verify.set_defaults(func=cmd_verify_conform)
 
     # inspect (debug)
     p_inspect = sub.add_parser(

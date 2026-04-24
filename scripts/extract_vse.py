@@ -74,10 +74,10 @@ def collect_strips(sequences, sources_by_path, strips_out, meta_parent=None):
         if hasattr(strip, "blend_alpha"):
             entry["blend_alpha"] = strip.blend_alpha
 
-        # volume / pitch for sound strips
+        # volume / pan for sound strips (pitch was removed in Blender 5.x)
         if strip.type == "SOUND":
             entry["volume"] = strip.volume
-            entry["pitch"] = strip.pitch
+            entry["pan"] = strip.pan
 
         # source file
         filepath = strip_source_path(strip)
@@ -102,7 +102,7 @@ def collect_strips(sequences, sources_by_path, strips_out, meta_parent=None):
 
         # recurse into META strips
         if strip.type == "META":
-            collect_strips(strip.sequences, sources_by_path, strips_out, meta_parent=strip.name)
+            collect_strips(strip.strips, sources_by_path, strips_out, meta_parent=strip.name)
 
 
 def main():
@@ -132,7 +132,7 @@ def main():
     else:
         sources_by_path = {}
         strips_out = []
-        collect_strips(seq_editor.sequences_all, sources_by_path, strips_out)
+        collect_strips(seq_editor.strips_all, sources_by_path, strips_out)
         manifest["sources"] = list(sources_by_path.values())
         manifest["strips"] = strips_out
 
