@@ -5,21 +5,22 @@ Applies ffmpeg transforms from a conform plan to produce conformed output files.
 
 Two conform modes are supported:
 
-Simple conform (no commercial breaks):
+Simple conform:
     A single ffmpeg pass applies offset, trim, crop, fps normalisation, and
-    scale. Speed is always 1.0 so no setpts or atempo filter is applied.
-    Used when source["dtw"]["segments"] is absent or empty.
+    scale. Speed is always 1.0. Used when source["dtw"]["segments"] is absent
+    or empty (i.e. all detected black breaks have frame_delta == 0).
 
-Segmented conform (commercial-break-aware, frame-perfect):
-    The video is cut into content segments and black-frame break segments.
-    Content segments are extracted at 1:1 speed with exactly author_frames
-    output frames (-frames:v). Break segments are synthesised as exact-length
-    black video with silence. All segments are encoded to a lossless
-    intermediate (FFV1 + PCM), then joined with ffmpeg concat demuxer + copy,
-    and finally re-encoded to the delivery format (libx264 CRF 16 + AAC 320k).
-
-    Used when source["dtw"]["segments"] is a non-empty list, written by
-    match_recipe.py when DTW detects commercial break length differences.
+Segmented conform (break-length-corrected, frame-perfect):
+    Used when DTW detects one or more black breaks where the viewer has more or
+    fewer frames than the author (frame_delta != 0). A single ffmpeg invocation
+    with a filter_complex graph handles all segments in one pass:
+      - Content segments: per-segment -ss/-t/-i seek inputs; fps, crop, scale,
+        trim=end_frame=AUTHOR_FRAMES, setpts=PTS-STARTPTS.
+      - Break segments: lavfi color/anullsrc sources synthesised to exactly
+        author_frames black frames + matching silence.
+      - All segments joined by a concat filter, producing uniform PTS with no
+        drift accumulation.
+    Output encoded directly to libx264 CRF 16 + AAC 320k in a single pass.
 
 Usage:
     python3 conform_sources.py \
@@ -174,41 +175,6 @@ def _simple_conform(source, input_file, work_dir):
 # Segmented conform helpers
 # ---------------------------------------------------------------------------
 
-# Lossless intermediate codec used for all per-segment files.
-# FFV1 + PCM ensures no generation loss before the final concat re-encode.
-_SEG_VCODEC = ["-c:v", "ffv1", "-level", "3", "-threads", "4"]
-_SEG_ACODEC = ["-c:a", "pcm_s16le"]
-
-# Delivery codec for the final concatenated output.
-_OUT_VCODEC = ["-c:v", "libx264", "-preset", "fast", "-crf", "16"]
-_OUT_ACODEC = ["-c:a", "aac", "-b:a", "320k"]
-
-
-def _vf_for_segment(fps_out, res_w, res_h, crop_spec):
-    """
-    Build the video filter string for a content segment.
-    Applies PTS normalisation, crop, fps normalisation, and scale so all
-    intermediates are identical in format (required for copy-concat).
-    setpts=PTS-STARTPTS resets the output PTS to start from 0 regardless of
-    where in the source file the seek landed. This prevents the concat demuxer
-    from accumulating audio/video seek-offset drift across segments.
-    """
-    parts = []
-    if crop_spec:
-        parts.append("crop={}:{}:{}:{}".format(
-            int(crop_spec["w"]), int(crop_spec["h"]),
-            int(crop_spec["x"]), int(crop_spec["y"])))
-    if fps_out:
-        parts.append("fps={:.6f}".format(fps_out))
-    if res_w and res_h:
-        parts.append("scale={}:{}:flags=lanczos".format(res_w, res_h))
-    # Reset PTS to 0 after all other filters so the FFV1 intermediate always
-    # starts at PTS=0. This must come AFTER fps so the fps filter uses the
-    # original source PTS for correct frame selection at the seek position.
-    parts.append("setpts=PTS-STARTPTS")
-    return ",".join(parts)
-
-
 def _probe_has_audio(input_file):
     """Return True if the file has at least one audio stream."""
     import json
@@ -225,124 +191,21 @@ def _probe_has_audio(input_file):
         return False
 
 
-def _extract_content_segment(input_file, seg, seg_path,
-                              fps_out, res_w, res_h, crop_spec, has_audio):
-    """
-    Extract a content segment from input_file at 1:1 speed with fps
-    normalisation, crop, and scale. Outputs exactly seg["author_frames"]
-    frames to a lossless intermediate (FFV1 + PCM when has_audio, FFV1-only
-    otherwise).
-    """
-    viewer_start_tc     = float(seg.get("viewer_start_tc") or 0.0)
-    viewer_duration_sec = float(seg.get("viewer_duration_secs") or 0.0)
-    author_frames       = int(seg.get("author_frames") or 0)
-
-    print("  seg[content] seek={:.3f}s extract={:.3f}s -> {}fr".format(
-        viewer_start_tc, viewer_duration_sec, author_frames), flush=True)
-
-    cmd = ["ffmpeg", "-y"]
-    if viewer_start_tc > 0.001:
-        cmd += ["-ss", "{:.6f}".format(viewer_start_tc)]
-    cmd += ["-i", input_file]
-    # Soft duration limit: +1s headroom keeps us from running into the next
-    # segment. -frames:v enforces the exact output frame count.
-    if viewer_duration_sec > 0.0:
-        cmd += ["-t", "{:.6f}".format(viewer_duration_sec + 1.0)]
-
-    vf = _vf_for_segment(fps_out, res_w, res_h, crop_spec)
-    if vf:
-        cmd += ["-vf", vf]
-
-    if has_audio:
-        # Normalize to 48000 Hz stereo so all segments are concat-compatible.
-        # asetpts=PTS-STARTPTS resets audio PTS to 0 to match the video PTS
-        # normalisation done by setpts=PTS-STARTPTS in the video filter chain.
-        cmd += ["-af", "asetpts=PTS-STARTPTS", "-ar", "48000", "-ac", "2"]
-
-    if author_frames > 0:
-        cmd += ["-frames:v", str(author_frames)]
-
-    cmd += _SEG_VCODEC
-    if has_audio:
-        cmd += _SEG_ACODEC
-    else:
-        cmd += ["-an"]
-    # -shortest ensures audio is truncated when video ends (prevents the +1s
-    # headroom on -t from adding extra audio duration per segment).
-    cmd += ["-shortest", "-hide_banner", seg_path]
-
-    r = subprocess.run(cmd)
-    if r.returncode != 0:
-        print("  ERROR: content segment ffmpeg failed", file=sys.stderr)
-        return False
-    if not os.path.exists(seg_path):
-        print("  ERROR: segment file not created: {}".format(seg_path), file=sys.stderr)
-        return False
-    return True
-
-
-def _generate_break_segment(seg, seg_path, fps_out, res_w, res_h, has_audio):
-    """
-    Synthesise a break segment as exact-length black video (and silence when
-    has_audio). Produces a lossless intermediate (FFV1 + optional PCM) at
-    the same stream layout as content segments so copy-concat works cleanly.
-    """
-    author_frames = int(seg.get("author_frames") or 0)
-    if author_frames <= 0:
-        open(seg_path, "wb").close()   # zero-length placeholder, skipped later
-        return True
-
-    w   = res_w  if res_w  else 1920
-    h   = res_h  if res_h  else 1080
-    fps = fps_out if fps_out else 24.0
-
-    print("  seg[break]   {}fr  {}x{}  {:.4f}fps".format(
-        author_frames, w, h, fps), flush=True)
-
-    # Duration passed to lavfi must be slightly longer than frames/fps so
-    # ffmpeg produces at least author_frames before -frames:v cuts it.
-    lavfi_dur = (author_frames + 2) / fps
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "lavfi",
-        "-i", "color=c=black:s={}x{}:r={:.6f}:d={:.6f}".format(
-            w, h, fps, lavfi_dur),
-    ]
-    if has_audio:
-        cmd += [
-            "-f", "lavfi",
-            "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
-        ]
-    cmd += ["-frames:v", str(author_frames)]
-    if has_audio:
-        cmd += ["-ar", "48000", "-ac", "2"]
-    cmd += _SEG_VCODEC
-    cmd += _SEG_ACODEC if has_audio else ["-an"]
-    # -shortest ensures audio is truncated when video ends.
-    cmd += ["-shortest", "-hide_banner", seg_path]
-
-    r = subprocess.run(cmd)
-    if r.returncode != 0:
-        print("  ERROR: break segment ffmpeg failed", file=sys.stderr)
-        return False
-    return True
-
-
 def _segmented_conform(source, input_file, work_dir):
     """
-    Frame-perfect segmented conform.
+    Frame-perfect segmented conform using a single-pass filter_complex.
 
-    1. Extract each content segment at 1:1 speed with exact -frames:v
-       output count (lossless FFV1 intermediate).
-    2. Synthesise each break as exact-length black + silence (FFV1).
-    3. Concat all segments with ffmpeg concat demuxer + -c copy.
-    4. Re-encode the joined lossless stream to the delivery format
-       (libx264 CRF 16 + AAC 320k).
+    One ffmpeg invocation handles all segments:
+      - Content segments: each gets its own -ss/-t/-i seek input. The per-input
+        stream is piped through fps, crop, scale, trim=end_frame=AUTHOR_FRAMES,
+        and setpts=PTS-STARTPTS inside the filtergraph.
+      - Break segments: synthesised inline as lavfi color (black) and
+        anullsrc sources, trimmed to exactly author_frames.
+      - A concat filter joins all video and audio streams in order, producing
+        a continuous output with uniform PTS from the very start. No intermediate
+        files are written so no PTS drift accumulates across segments.
 
-    The two-pass approach (lossless intermediate -> delivery encode) avoids
-    generation loss that would occur if each segment were pre-encoded to
-    the lossy delivery format before concat-re-encode.
+    Output: libx264 CRF 16 + AAC 320k directly from the filtergraph.
     """
     slot_id  = source.get("slot_id", "?")
     segments = source["dtw"]["segments"]
@@ -352,87 +215,149 @@ def _segmented_conform(source, input_file, work_dir):
     output_filename = source.get("output_filename") or "{}_conformed.mkv".format(slot_id)
     output_path = os.path.join(work_dir, output_filename)
 
-    seg_dir = os.path.join(work_dir, "{}_segtmp".format(slot_id))
-    os.makedirs(seg_dir, exist_ok=True)
-
     has_audio = _probe_has_audio(input_file)
+
+    fps = fps_out if fps_out else 24.0
+    w   = res_w   if res_w   else 1920
+    h   = res_h   if res_h   else 1080
 
     n_content = sum(1 for s in segments if s["type"] == "content")
     n_break   = sum(1 for s in segments if s["type"] == "break")
-    print("  Segmented conform: {} content + {} break segments  audio={}".format(
+    n_total   = n_content + n_break
+
+    print("  Segmented conform (filtergraph): {} content + {} break segments  audio={}".format(
         n_content, n_break, has_audio), flush=True)
-    if fps_out:
-        print("  Target: {}x{}  {:.4f}fps".format(res_w, res_h, fps_out), flush=True)
+    print("  Target: {}x{}  {:.6f}fps".format(w, h, fps), flush=True)
 
-    seg_paths = []
-    for idx, seg in enumerate(segments):
-        seg_path = os.path.join(seg_dir, "seg_{:04d}.mkv".format(idx))
+    # -- Build command inputs (one -ss/-t/-i per content segment) -----------
+    cmd = ["ffmpeg", "-y"]
 
+    # Map each content segment to its ffmpeg input index.
+    input_idx = 0
+    seg_input_idx = {}  # seg_list_index -> ffmpeg input index
+    for seg_idx, seg in enumerate(segments):
+        if seg["type"] != "content":
+            continue
+        author_frames = int(seg.get("author_frames") or 0)
+        if author_frames <= 0:
+            continue
+        viewer_start_tc      = float(seg.get("viewer_start_tc")      or 0.0)
+        viewer_duration_secs = float(seg.get("viewer_duration_secs") or 0.0)
+        if viewer_start_tc > 0.001:
+            cmd += ["-ss", "{:.6f}".format(viewer_start_tc)]
+        # +1s headroom on the read window so ffmpeg decodes enough frames
+        # before trim=end_frame cuts at the exact count.
+        cmd += ["-t", "{:.6f}".format(viewer_duration_secs + 1.0)]
+        cmd += ["-i", input_file]
+        seg_input_idx[seg_idx] = input_idx
+        input_idx += 1
+
+    if input_idx == 0:
+        print("  ERROR: no content segments with frames > 0", file=sys.stderr)
+        return False
+
+    # -- Build filter_complex -----------------------------------------------
+    # Each segment contributes one video pad and (if has_audio) one audio pad.
+    # collect_v / collect_a are the named output pads in concat order.
+    filter_parts = []
+    collect_v = []
+    collect_a = []
+
+    for seg_idx, seg in enumerate(segments):
         if seg["type"] == "content":
-            ok = _extract_content_segment(
-                input_file, seg, seg_path,
-                fps_out, res_w, res_h, crop_spec, has_audio)
-        else:
-            ok = _generate_break_segment(
-                seg, seg_path, fps_out, res_w, res_h, has_audio)
+            author_frames = int(seg.get("author_frames") or 0)
+            if author_frames <= 0:
+                continue
+            in_idx = seg_input_idx[seg_idx]
+            content_dur = author_frames / fps
 
-        if not ok:
-            _cleanup_seg_dir(seg_dir, seg_paths)
-            return False
+            # Video: crop (optional) -> fps -> scale (optional) ->
+            #        trim=end_frame=N (exact frame count) ->
+            #        setpts=PTS-STARTPTS (reset PTS to 0) -> yuv420p
+            vchain = []
+            if crop_spec:
+                vchain.append("crop={}:{}:{}:{}".format(
+                    int(crop_spec["w"]), int(crop_spec["h"]),
+                    int(crop_spec["x"]), int(crop_spec["y"])))
+            vchain.append("fps={:.6f}".format(fps))
+            if res_w and res_h:
+                vchain.append("scale={}:{}:flags=lanczos".format(w, h))
+            vchain.append("trim=end_frame={}".format(author_frames))
+            vchain.append("setpts=PTS-STARTPTS")
+            vchain.append("format=yuv420p")
+            v_label = "c{}v".format(seg_idx)
+            filter_parts.append("[{}:v]{}[{}]".format(
+                in_idx, ",".join(vchain), v_label))
+            collect_v.append("[{}]".format(v_label))
 
-        # Skip zero-length break files
-        if os.path.getsize(seg_path) > 0:
-            seg_paths.append(seg_path)
-        else:
-            os.unlink(seg_path)
+            if has_audio:
+                a_label = "c{}a".format(seg_idx)
+                filter_parts.append(
+                    "[{}:a]aresample=48000,atrim=duration={:.6f},"
+                    "asetpts=PTS-STARTPTS[{}]".format(
+                        in_idx, content_dur, a_label))
+                collect_a.append("[{}]".format(a_label))
 
-    if not seg_paths:
-        print("  ERROR: no segment files produced", file=sys.stderr)
+        else:  # break
+            author_frames = int(seg.get("author_frames") or 0)
+            if author_frames <= 0:
+                # Zero-frame break: skip (viewer and author agree, no synthesis needed)
+                continue
+            break_dur = author_frames / fps
+            # Overshoot by 2 frames so the color source definitely produces
+            # enough frames before trim=end_frame cuts exactly.
+            lavfi_dur = break_dur + 2.0 / fps
+
+            v_raw   = "b{}vr".format(seg_idx)
+            v_label = "b{}v".format(seg_idx)
+            filter_parts.append(
+                "color=c=black:s={}x{}:r={:.6f}:d={:.6f}[{}]".format(
+                    w, h, fps, lavfi_dur, v_raw))
+            filter_parts.append(
+                "[{}]trim=end_frame={},setpts=PTS-STARTPTS,format=yuv420p[{}]".format(
+                    v_raw, author_frames, v_label))
+            collect_v.append("[{}]".format(v_label))
+
+            if has_audio:
+                a_raw   = "b{}ar".format(seg_idx)
+                a_label = "b{}a".format(seg_idx)
+                filter_parts.append(
+                    "anullsrc=r=48000:cl=stereo[{}]".format(a_raw))
+                filter_parts.append(
+                    "[{}]atrim=duration={:.6f},asetpts=PTS-STARTPTS[{}]".format(
+                        a_raw, break_dur, a_label))
+                collect_a.append("[{}]".format(a_label))
+
+    # Count actual pads (zero-frame segments may have been skipped)
+    n_pads = len(collect_v)
+    if n_pads == 0:
+        print("  ERROR: filtergraph has no segments", file=sys.stderr)
         return False
 
-    # Write concat list
-    concat_list = os.path.join(seg_dir, "concat.txt")
-    with open(concat_list, "w") as f:
-        for sp in seg_paths:
-            # Use absolute paths; safe=0 is required for that
-            f.write("file '{}'\n".format(sp))
+    filter_parts.append(
+        "{}concat=n={}:v=1:a=0[outv]".format("".join(collect_v), n_pads))
+    if has_audio:
+        filter_parts.append(
+            "{}concat=n={}:v=0:a=1[outa]".format("".join(collect_a), n_pads))
 
-    # Join all lossless segments and re-encode to delivery format.
-    # Two ffmpegs chained via pipe avoids writing a large lossless joined file.
-    # concat demuxer -> pipe -> libx264 encoder.
-    joined_path = os.path.join(seg_dir, "joined.mkv")
-    print("  Concatenating {} segments -> lossless join...".format(
-        len(seg_paths)), flush=True)
-    join_cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0",
-        "-i", concat_list,
-        "-c", "copy",
-        "-hide_banner",
-        joined_path,
-    ]
-    r = subprocess.run(join_cmd)
+    cmd += ["-filter_complex", ";".join(filter_parts)]
+    cmd += ["-map", "[outv]"]
+    if has_audio:
+        cmd += ["-map", "[outa]"]
+    else:
+        cmd += ["-an"]
+
+    cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "16"]
+    if has_audio:
+        cmd += ["-c:a", "aac", "-b:a", "320k"]
+    cmd += ["-hide_banner", output_path]
+
+    print("  Running filtergraph conform ({} pads)...".format(n_pads), flush=True)
+    r = subprocess.run(cmd)
     if r.returncode != 0:
-        print("  ERROR: concat join failed", file=sys.stderr)
-        _cleanup_seg_dir(seg_dir, seg_paths + [concat_list])
+        print("  ERROR: filtergraph conform failed (exit {})".format(r.returncode),
+              file=sys.stderr)
         return False
-
-    print("  Encoding joined lossless -> delivery format...", flush=True)
-    encode_cmd = [
-        "ffmpeg", "-y",
-        "-i", joined_path,
-    ] + _OUT_VCODEC + _OUT_ACODEC + [
-        "-hide_banner",
-        output_path,
-    ]
-    r = subprocess.run(encode_cmd)
-    if r.returncode != 0:
-        print("  ERROR: delivery encode failed", file=sys.stderr)
-        _cleanup_seg_dir(seg_dir, seg_paths + [concat_list, joined_path])
-        return False
-
-    # Clean up all intermediate files
-    _cleanup_seg_dir(seg_dir, seg_paths + [concat_list, joined_path])
 
     if not os.path.exists(output_path):
         print("  ERROR: output file not created", file=sys.stderr)
@@ -441,18 +366,6 @@ def _segmented_conform(source, input_file, work_dir):
     print("  Written: {:.1f}MB  ({})".format(
         os.path.getsize(output_path) / 1e6, output_path), flush=True)
     return True
-
-
-def _cleanup_seg_dir(seg_dir, files):
-    for f in files:
-        try:
-            os.unlink(f)
-        except OSError:
-            pass
-    try:
-        os.rmdir(seg_dir)
-    except OSError:
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -465,10 +378,12 @@ def conform_source(source, input_file, work_dir):
     Apply timing transforms from a conform plan source entry to input_file.
 
     Dispatch:
-        segmented conform  - when dtw.segments is non-empty. Uses FFV1 lossless
-                             intermediates per segment. Used when DTW detected
-                             break length differences between author and viewer.
-        simple conform     - single-pass trim, fps, crop, scale. No speed warp.
+        segmented conform  - when dtw.segments is non-empty. Single-pass
+                             filter_complex with per-segment seeks and lavfi
+                             black synthesisers. Used when DTW detected breaks
+                             where the viewer has more or fewer frames than the
+                             author (frame_delta != 0).
+        simple conform     - single-pass trim, fps, crop, scale.
                              Used when no DTW segments are present.
 
     Returns True on success.

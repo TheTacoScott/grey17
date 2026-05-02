@@ -25,15 +25,18 @@ cost hamming(author[i], viewer[j]) at the destination, and the DP computes
 the minimum cumulative cost from (0,0) to each cell. Traceback recovers the
 cheapest (lowest total Hamming) path, not the shortest (fewest steps) path.
 
+Band centering: the band is always centered on the diagonal. The default
+half-band of 10000 frames (~417s at 24fps) accommodates any realistic
+initial offset between a viewer file and the author source without a
+pre-search step.
+
 Black segment detection: the author pHash sequence is scanned for runs of
 near-black frames. Each detected break is mapped to its corresponding viewer
 timecode range using the DTW path, giving the viewer break duration. The
 delta (viewer_frames - author_frames) per break quantifies how many frames
 the consumer has extra or fewer, which a downstream segmented conform can use
-to achieve frame-perfect alignment.
-
-Optional sub_frame_factor > 1: extracts viewer at fps * N for sub-frame
-resolution. Increases viewer sequence length and band width by factor N.
+to achieve frame-perfect alignment. Break boundaries are then refined to
+half-frame precision via a targeted local search.
 """
 
 import os
@@ -41,7 +44,7 @@ import struct
 import tempfile
 from utils import extract_phashes_pipe
 
-# bisect is stdlib - used in _compute_segment_transforms
+# bisect is stdlib - used in _map_breaks_via_path
 import bisect
 
 _PC = [bin(i).count("1") for i in range(65536)]
@@ -51,14 +54,13 @@ _PC = [bin(i).count("1") for i in range(65536)]
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _pred_j(i, speed, offset, fps, viewer_fps, m):
+def _pred_j(i, viewer_fps, fps, m):
     """
     Predicted viewer frame index for author frame i.
-    author_tc = i / fps
-    viewer_tc = author_tc * speed + offset
-    viewer_frame = int(viewer_tc * viewer_fps)
+    Band is always centered on the diagonal (speed=1.0, offset=0.0).
+    viewer_frame = int(i * viewer_fps / fps)
     """
-    j = int((i / fps * speed + offset) * viewer_fps)
+    j = int(i * viewer_fps / fps)
     return max(0, min(m - 1, j))
 
 
@@ -357,8 +359,7 @@ class _StripeStore:
 # Forward DP pass
 # ---------------------------------------------------------------------------
 
-def _forward_pass(author_ints, viewer_ints, speed, offset, fps, viewer_fps,
-                  band, store):
+def _forward_pass(author_ints, viewer_ints, fps, viewer_fps, band, store):
     """
     Fill the DTW DP table row by row.
 
@@ -388,7 +389,7 @@ def _forward_pass(author_ints, viewer_ints, speed, offset, fps, viewer_fps,
     # Standard DTW: D[0,j] = cost(0,j) + D[0,j-1], D[0,j_lo] = cost(0,j_lo).
     # All up/diagonal predecessors are non-existent so treated as INF.
     # ------------------------------------------------------------------
-    jc0 = _pred_j(0, speed, offset, fps, viewer_fps, m)
+    jc0 = _pred_j(0, viewer_fps, fps, m)
     j_lo_0 = max(0, jc0 - band)
     j_hi_0 = min(m - 1, jc0 + band)
     width_0 = j_hi_0 - j_lo_0 + 1
@@ -415,7 +416,7 @@ def _forward_pass(author_ints, viewer_ints, speed, offset, fps, viewer_fps,
     # Rows 1..n-1: standard three-predecessor recurrence.
     # ------------------------------------------------------------------
     for i in range(1, n):
-        jc = _pred_j(i, speed, offset, fps, viewer_fps, m)
+        jc = _pred_j(i, viewer_fps, fps, m)
         j_lo = max(0, jc - band)
         j_hi = min(m - 1, jc + band)
         width = j_hi - j_lo + 1
@@ -465,7 +466,7 @@ def _forward_pass(author_ints, viewer_ints, speed, offset, fps, viewer_fps,
 # Traceback
 # ---------------------------------------------------------------------------
 
-def _traceback(n, m, final_row, speed, offset, fps, viewer_fps, band, store):
+def _traceback(n, m, final_row, fps, viewer_fps, band, store):
     """
     Trace the minimum-cost path from the best endpoint in the final row back
     to (0, 0). Releases stripes from RAM as traceback moves to older rows.
@@ -475,7 +476,7 @@ def _traceback(n, m, final_row, speed, offset, fps, viewer_fps, band, store):
     sh = store._sh
 
     # Best endpoint: minimum cost within band on final row
-    jc = _pred_j(n - 1, speed, offset, fps, viewer_fps, m)
+    jc = _pred_j(n - 1, viewer_fps, fps, m)
     j_lo_last = max(0, jc - band)
     j_hi_last = min(m - 1, jc + band)
     best_j, best_cost = j_lo_last, INF
@@ -544,14 +545,74 @@ def _traceback(n, m, final_row, speed, offset, fps, viewer_fps, band, store):
 
 
 # ---------------------------------------------------------------------------
+# Sub-frame refinement of break boundary TCs
+# ---------------------------------------------------------------------------
+
+def _hamming(a, b):
+    x = a ^ b
+    return (_PC[x & 0xFFFF] + _PC[(x >> 16) & 0xFFFF] +
+            _PC[(x >> 32) & 0xFFFF] + _PC[(x >> 48) & 0xFFFF])
+
+
+def _refine_break_boundary(viewer_path, author_ints, b, fps,
+                            probe_frames=60, half_frame_steps=4):
+    """
+    Refine viewer_end_tc for a single non-zero-delta break by testing
+    sub-frame candidate positions around the DTW prediction.
+
+    The DTW path gives viewer_end_tc accurate to +-1 frame (the median
+    deviation is rounded to the nearest integer frame). This function
+    tests positions at half-frame increments across a window of
+    +-half_frame_steps frames, comparing probe_frames of author content
+    starting at b["author_end_frame"] against the viewer at each candidate
+    seek point.
+
+    Returns the refined viewer_end_tc (float, seconds).
+    """
+    author_end_fr = b["author_end_frame"]
+    probe_ints = author_ints[author_end_fr:author_end_fr + probe_frames]
+    n_probe = len(probe_ints)
+    if n_probe == 0:
+        return b["viewer_end_tc"]
+
+    base_tc = b["viewer_end_tc"]
+    half_step = 0.5 / fps  # half-frame increment
+
+    best_tc    = base_tc
+    best_score = float("inf")
+
+    n_candidates = half_frame_steps * 2 * 2 + 1  # +-half_frame_steps frames in 0.5-fr steps
+    for i in range(-(half_frame_steps * 2), half_frame_steps * 2 + 1):
+        candidate_tc = max(0.0, base_tc + i * half_step)
+        viewer_frames = extract_phashes_pipe(
+            viewer_path, candidate_tc, fps, n_frames=n_probe)
+        if len(viewer_frames) < n_probe:
+            continue
+        viewer_ints_c = [int(h, 16) for h in viewer_frames]
+        total = sum(_hamming(probe_ints[j], viewer_ints_c[j]) for j in range(n_probe))
+        score = total / n_probe
+        if score < best_score:
+            best_score = score
+            best_tc    = candidate_tc
+
+    return best_tc
+
+
+# ---------------------------------------------------------------------------
 # Segment transform computation
 # ---------------------------------------------------------------------------
 
 def _compute_segment_transforms(path, author_breaks, fps, n_author):
     """
     Build a segment list for the segmented conform from the DTW path and
-    detected black-segment breaks. Speed is always 1.0; only viewer_start_tc
-    and author_frames differ between author and viewer.
+    detected black-segment breaks.
+
+    Only breaks where frame_delta != 0 require a split: the viewer has more or
+    fewer frames in the break region than the author, so we synthesize exactly
+    author_frames black frames and skip the viewer's break entirely. Zero-delta
+    breaks are transparent to the conform (viewer frames are black and match the
+    author count exactly) so they are absorbed into the surrounding content
+    segments without creating a split.
 
     The output is a list of alternating content and break dicts:
         [content, break, content, break, ..., content]
@@ -574,28 +635,31 @@ def _compute_segment_transforms(path, author_breaks, fps, n_author):
     viewer_end_tc (computed via path deviation in _map_breaks_via_path), so
     the full break region including fades is correctly skipped in the viewer.
 
-    Returns an empty list when author_breaks is empty (caller uses simple
-    single-pass conform instead).
+    Returns an empty list when no non-zero-delta breaks exist (caller uses
+    simple single-pass conform instead).
     """
-    if not author_breaks or not path:
+    if not path:
         return []
 
-    breaks_sorted = sorted(author_breaks, key=lambda b: b["author_start_tc"])
+    # Only split at breaks where the viewer break length differs from the author.
+    adjustments = [b for b in sorted(author_breaks, key=lambda b: b["author_start_tc"])
+                   if b["frame_delta"] != 0]
+
+    if not adjustments:
+        return []
 
     segments = []
 
-    # Viewer TC at author t=0: the deviation at the path start gives the
-    # initial offset between the two files.
+    # Viewer TC at author t=0: path[0][1] is the viewer frame index at the
+    # first path point; dividing by fps gives the initial viewer offset.
     initial_viewer_tc = path[0][1] / fps
 
     prev_author_end_tc = 0.0
     prev_viewer_end_tc = initial_viewer_tc
 
-    for b in breaks_sorted:
-        c_author_start  = prev_author_end_tc
-        c_author_end    = b["author_start_tc"]
-        c_a_start_fr    = int(round(c_author_start * fps))
-        c_a_end_fr      = int(round(c_author_end   * fps))
+    for b in adjustments:
+        c_a_start_fr    = int(round(prev_author_end_tc * fps))
+        c_a_end_fr      = int(round(b["author_start_tc"] * fps))
         c_author_frames = max(0, c_a_end_fr - c_a_start_fr)
 
         if c_author_frames > 0:
@@ -603,8 +667,8 @@ def _compute_segment_transforms(path, author_breaks, fps, n_author):
             # content duration. +1s headroom is added by the conform step.
             segments.append({
                 "type":               "content",
-                "author_start_tc":    round(c_author_start, 6),
-                "author_end_tc":      round(c_author_end,   6),
+                "author_start_tc":    round(prev_author_end_tc, 6),
+                "author_end_tc":      round(b["author_start_tc"], 6),
                 "author_frames":      c_author_frames,
                 "viewer_start_tc":    round(prev_viewer_end_tc, 6),
                 "viewer_duration_secs": round(c_author_frames / fps, 6),
@@ -618,21 +682,19 @@ def _compute_segment_transforms(path, author_breaks, fps, n_author):
         })
 
         prev_author_end_tc = b["author_end_tc"]
-        # viewer_end_tc already accounts for the full break including fades
+        # viewer_end_tc accounts for the full break region including fades
         # (computed via path deviation in _map_breaks_via_path).
         prev_viewer_end_tc = b["viewer_end_tc"]
 
-    # Final content segment after the last break
-    c_author_start  = prev_author_end_tc
-    c_author_end    = n_author / fps
-    c_a_start_fr    = int(round(c_author_start * fps))
+    # Final content segment after the last adjustment break.
+    c_a_start_fr    = int(round(prev_author_end_tc * fps))
     c_author_frames = max(0, n_author - c_a_start_fr)
 
     if c_author_frames > 0:
         segments.append({
             "type":               "content",
-            "author_start_tc":    round(c_author_start, 6),
-            "author_end_tc":      round(c_author_end,   6),
+            "author_start_tc":    round(prev_author_end_tc, 6),
+            "author_end_tc":      round(n_author / fps, 6),
             "author_frames":      c_author_frames,
             "viewer_start_tc":    round(prev_viewer_end_tc, 6),
             "viewer_duration_secs": round(c_author_frames / fps, 6),
@@ -645,15 +707,14 @@ def _compute_segment_transforms(path, author_breaks, fps, n_author):
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def run_dtw(author_hashes, viewer_path, speed, offset, fps,
+def run_dtw(author_hashes, viewer_path, fps,
             crop=None, band_frames=10000, sub_frame_factor=1,
             stripe_height=2000, max_mem_mb=256, tmp_dir=None):
     """
-    Full-frame DTW alignment. No downsampling.
+    Full-frame DTW alignment. No downsampling. Band centered on diagonal.
 
     author_hashes:    full per-frame pHash list from recipe phash_sequence
     viewer_path:      path to viewer video file (inside Docker)
-    speed, offset:    linear model from anchor fit; centers the Sakoe-Chiba band
     fps:              author native fps; viewer is also extracted at this rate
     crop:             optional {w,h,x,y} dict applied before hashing
     band_frames:      Sakoe-Chiba half-band in ORIGINAL frame units.
@@ -717,10 +778,10 @@ def run_dtw(author_hashes, viewer_path, speed, offset, fps,
     store = _StripeStore(stripe_height, max_mem_stripes, tmp_dir=tmp_dir)
     try:
         final_row = _forward_pass(
-            author_ints, viewer_ints, speed, offset, fps, viewer_fps, band, store)
+            author_ints, viewer_ints, fps, viewer_fps, band, store)
         print("  [DTW] forward pass complete, tracing back...", flush=True)
         path = _traceback(
-            n, m, final_row, speed, offset, fps, viewer_fps, band, store)
+            n, m, final_row, fps, viewer_fps, band, store)
     finally:
         store.cleanup()
 
@@ -747,6 +808,21 @@ def run_dtw(author_hashes, viewer_path, speed, offset, fps,
     author_breaks_raw = detect_black_segments(author_hashes, fps)
     author_breaks = _map_breaks_via_path(author_breaks_raw, path, fps)
 
+    # Sub-frame refinement: for each non-zero-delta break, test half-frame
+    # candidate TCs around the DTW prediction to pin the exact seek point
+    # where viewer content resumes after the break.
+    for b in author_breaks:
+        if b["frame_delta"] == 0:
+            continue
+        old_tc = b["viewer_end_tc"]
+        refined_tc = _refine_break_boundary(
+            viewer_path, author_ints, b, fps)
+        b["viewer_end_tc"] = refined_tc
+        shift_fr = (refined_tc - old_tc) * fps
+        print("  [DTW]   refine break @{:.2f}s: viewer_end_tc {:.6f}s -> {:.6f}s "
+              "({:+.2f}fr)".format(
+                  b["author_start_tc"], old_tc, refined_tc, shift_fr), flush=True)
+
     # Build per-segment transforms for the segmented conform pass.
     segments = _compute_segment_transforms(path, author_breaks, fps, n)
 
@@ -762,7 +838,12 @@ def run_dtw(author_hashes, viewer_path, speed, offset, fps,
                   b["viewer_start_tc"], b["viewer_end_tc"],
                   b["frame_delta"]), flush=True)
 
+    # Viewer TC at author frame 0: this is the true initial offset between the
+    # two files, derived directly from the DTW path rather than an anchor search.
+    initial_offset_seconds = path[0][1] / fps
+
     return {
+        "initial_offset_seconds": round(initial_offset_seconds, 6),
         "diag_offset":   round(diag_offset, 6),
         "rms_frames":    round(rms, 2),
         "max_frames":    round(max_dev, 2),

@@ -59,7 +59,12 @@ def patch_sequences(sequences, path_map, patched, skipped):
             else:
                 skipped.append(("SOUND", orig))
         elif strip.type == "META":
-            patch_sequences(strip.sequences, path_map, patched, skipped)
+            for attr in ("sequences", "strips"):
+                try:
+                    patch_sequences(getattr(strip, attr), path_map, patched, skipped)
+                    break
+                except AttributeError:
+                    continue
 
 
 def main():
@@ -73,9 +78,24 @@ def main():
         print("ERROR: no sequence editor found in scene")
         sys.exit(1)
 
+    # Blender 5.x renamed the sequences collection. Find it by introspection.
+    seqs = None
+    for attr in ("sequences_all", "sequences", "strips"):
+        try:
+            seqs = getattr(seq_editor, attr)
+            print("Using seq_editor.{}".format(attr))
+            break
+        except AttributeError:
+            continue
+    if seqs is None:
+        seq_attrs = [a for a in dir(seq_editor) if not a.startswith("_")]
+        print("ERROR: cannot find sequences collection on SequenceEditor")
+        print("Available attributes: {}".format(seq_attrs))
+        sys.exit(1)
+
     patched = []
     skipped = []
-    patch_sequences(seq_editor.sequences_all, path_map, patched, skipped)
+    patch_sequences(seqs, path_map, patched, skipped)
 
     print("Patched {} strips:".format(len(patched)))
     for orig, new in patched:

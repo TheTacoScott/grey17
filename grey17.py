@@ -773,12 +773,7 @@ def cmd_match(args):
         "--recipe", "/work/recipe/{}".format(recipe_filename),
         "--output", "/work/out/{}".format(output_filename),
         "--work-dir", "/work/tmp",
-        "--threshold", str(args.threshold),
-        "--search-fraction", str(args.search_fraction),
-        "--probe-frames", str(args.probe_frames),
     ]
-    if args.no_dtw:
-        match_cmd.append("--no-dtw")
 
     for src in slots:
         sid = src["id"]
@@ -1335,7 +1330,7 @@ def main():
     # sign-recipe
     p_sign = sub.add_parser(
         "sign-recipe",
-        help="Fingerprint source videos and write anchor points into a recipe",
+        help="Fingerprint source videos and write pHash sequence and audio fingerprints into a recipe",
     )
     p_sign.add_argument("recipe", metavar="<recipe.yaml>")
     p_sign.add_argument("--source", action="append", default=[],
@@ -1360,19 +1355,6 @@ def main():
     p_match.add_argument("--slot", action="append", default=[],
                          metavar="slot_id=/path/to/file",
                          help="Explicitly assign a file to a slot (repeatable)")
-    p_match.add_argument("--threshold", type=float, default=0.65,
-                         metavar="<0.0-1.0>",
-                         help="Minimum match quality for a file to be suitable (default: 0.65). "
-                              "Based on start/end probe pHash distances.")
-    p_match.add_argument("--search-fraction", type=float, default=0.25,
-                         metavar="<0.0-1.0>",
-                         help="Fraction of viewer to search at each end (default: 0.25). "
-                              "Increase if viewer has very long pre-roll or extended credits.")
-    p_match.add_argument("--probe-frames", type=int, default=500,
-                         metavar="<frames>",
-                         help="Sliding window probe size in frames (default: 500 = ~21s at 24fps).")
-    p_match.add_argument("--no-dtw", action="store_true",
-                         help="Skip DTW refinement pass (faster, uses anchor LSQ fit only).")
     p_match.set_defaults(func=cmd_match)
 
     # cook

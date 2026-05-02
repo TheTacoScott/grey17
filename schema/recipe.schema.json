@@ -113,11 +113,6 @@
           "type": "array",
           "description": "Raw Chromaprint fingerprint integers for the last portion of audio.",
           "items": { "type": "integer" }
-        },
-        "breaks": {
-          "type": "array",
-          "description": "Commercial break candidates detected during signing: segments that are simultaneously black and silent in the author source. Each entry gives exact timecodes and frame numbers in the author source.",
-          "items": { "$ref": "#/definitions/break_interval" }
         }
       }
     },
@@ -157,17 +152,5 @@
         "y": { "type": "integer" }
       }
     },
-    "break_interval": {
-      "type": "object",
-      "required": ["start_seconds", "end_seconds", "duration_seconds", "start_frame", "end_frame"],
-      "additionalProperties": false,
-      "properties": {
-        "start_seconds":    { "type": "number", "description": "Start of the black+silent segment in author source seconds." },
-        "end_seconds":      { "type": "number", "description": "End of the black+silent segment in author source seconds." },
-        "duration_seconds": { "type": "number", "description": "Duration of the segment in seconds." },
-        "start_frame":      { "type": "integer", "description": "Start frame index in the author phash_sequence." },
-        "end_frame":        { "type": "integer", "description": "End frame index in the author phash_sequence." }
-      }
-    }
   }
 }

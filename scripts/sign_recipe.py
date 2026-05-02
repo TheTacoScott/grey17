@@ -24,7 +24,7 @@ import sys
 
 import yaml
 
-from utils import compute_sha256, ffprobe_source, detect_crop, extract_phashes_pipe, run_fpcalc, detect_break_intervals
+from utils import compute_sha256, ffprobe_source, detect_crop, extract_phashes_pipe, run_fpcalc
 
 # ---------------------------------------------------------------------------
 # Audio fingerprint constants
@@ -74,7 +74,7 @@ def sign_source(source, source_path):
     Sign a single source file.
     Returns (meta, phash_sequence, audio_start_fp, audio_end_fp).
 
-    phash_sequence is a concatenated hex string of every frame's pHash.
+    phash_sequence is a list of 16-char hex pHash strings, one per frame.
     audio_start_fp and audio_end_fp are lists of Chromaprint ints.
     """
     source_id = source["id"]
@@ -148,24 +148,7 @@ def sign_source(source, source_path):
     else:
         print("  WARNING: audio_end_fp extraction failed", flush=True)
 
-    # Detect commercial breaks: segments that are both black and silent.
-    print("  Detecting commercial breaks (blackdetect + silencedetect)...", flush=True)
-    breaks = detect_break_intervals(source_path)
-    if breaks:
-        native_fps = meta.get("fps") or 24.0
-        for brk in breaks:
-            brk["start_frame"] = int(brk["start_seconds"] * native_fps)
-            brk["end_frame"]   = int(brk["end_seconds"]   * native_fps)
-        print("  Found {} break(s):".format(len(breaks)), flush=True)
-        for brk in breaks:
-            print("    {:.3f}s - {:.3f}s  ({:.3f}s  frames {}-{})".format(
-                brk["start_seconds"], brk["end_seconds"],
-                brk["duration_seconds"], brk["start_frame"], brk["end_frame"],
-            ), flush=True)
-    else:
-        print("  No commercial breaks detected.", flush=True)
-
-    return meta, phash_sequence, audio_start_fp, audio_end_fp, breaks
+    return meta, phash_sequence, audio_start_fp, audio_end_fp
 
 # ---------------------------------------------------------------------------
 # Main
@@ -190,7 +173,7 @@ def main():
 
         print("\nSigning {} ({})".format(slot_id, os.path.basename(source_path)), flush=True)
         try:
-            meta, phash_sequence, audio_start_fp, audio_end_fp, breaks = sign_source(source, source_path)
+            meta, phash_sequence, audio_start_fp, audio_end_fp = sign_source(source, source_path)
         except Exception as e:
             print("ERROR signing {}: {}".format(slot_id, e), file=sys.stderr)
             continue
@@ -216,21 +199,17 @@ def main():
             source["audio_start_fp"] = audio_start_fp
         if audio_end_fp:
             source["audio_end_fp"] = audio_end_fp
-        if breaks:
-            source["breaks"] = breaks
-        else:
-            source.pop("breaks", None)
+        source.pop("breaks", None)
 
         # Remove fields from previous sign format
         for key in ("anchors", "start_anchors", "end_anchors",
                     "start_sequence", "end_sequence", "strip_timecodes"):
             source.pop(key, None)
 
-        print("  Done: {} frames, {} audio start ints, {} audio end ints, {} breaks".format(
+        print("  Done: {} frames, {} audio start ints, {} audio end ints".format(
             len(phash_sequence),
             len(audio_start_fp) if audio_start_fp else 0,
             len(audio_end_fp) if audio_end_fp else 0,
-            len(breaks),
         ), flush=True)
 
     recipe["signed"] = True
