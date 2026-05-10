@@ -501,7 +501,7 @@ def parse_recipe_minimal(recipe_path):
       signed: bool
       sources: list of {id, filename, filepath_on_author_machine}
     """
-    result = {"signed": False, "sources": []}
+    result = {"signed": False, "sources": [], "cooked_phash_sequence": False}
     current_source = None
     in_sources = False
     in_original = False
@@ -520,6 +520,11 @@ def parse_recipe_minimal(recipe_path):
             if line.startswith("signed:"):
                 val = line.split(":", 1)[1].strip().lower()
                 result["signed"] = val == "true"
+                continue
+
+            # Top-level cooked_phash_sequence presence check
+            if line.startswith("cooked_phash_sequence:"):
+                result["cooked_phash_sequence"] = True
                 continue
 
             # Detect sources: block start
@@ -1292,6 +1297,114 @@ def cmd_verify_conform(args):
 
 
 # ---------------------------------------------------------------------------
+# cmd_fingerprint_cook
+# ---------------------------------------------------------------------------
+
+def cmd_fingerprint_cook(args):
+    recipe_path = os.path.abspath(args.recipe)
+    video_path  = os.path.abspath(args.video)
+
+    if not os.path.exists(recipe_path):
+        die("Recipe file not found: {}".format(recipe_path))
+    if not os.path.exists(video_path):
+        die("Cooked video not found: {}".format(video_path))
+
+    recipe_meta = parse_recipe_minimal(recipe_path)
+    if not recipe_meta.get("signed"):
+        die("Recipe has not been signed yet. Run sign-recipe first.")
+
+    if recipe_meta.get("cooked_phash_sequence") and not args.force:
+        die("Recipe already has cooked_phash_sequence. Use --force to re-fingerprint.")
+
+    recipe_dir      = os.path.dirname(recipe_path)
+    recipe_filename = os.path.basename(recipe_path)
+    video_filename  = os.path.basename(video_path)
+
+    ensure_image()
+
+    mounts = [
+        (recipe_dir, "/work/recipe", "rw"),
+        (video_path, "/work/video/{}".format(video_filename), "ro"),
+        (SCRIPTS_DIR, "/scripts", "ro"),
+    ]
+
+    fp_cmd = [
+        "python3", "/scripts/fingerprint_cook.py",
+        "--recipe", "/work/recipe/{}".format(recipe_filename),
+        "--video",  "/work/video/{}".format(video_filename),
+    ]
+
+    print("Fingerprinting cooked output: {}".format(video_filename))
+    result = run_docker(DOCKER_IMAGE, mounts, fp_cmd)
+    if result.returncode != 0:
+        die("fingerprint-cook failed (exit {})".format(result.returncode))
+
+    print("\nDone. Recipe updated with cooked_phash_sequence.")
+
+
+# ---------------------------------------------------------------------------
+# cmd_verify_cook
+# ---------------------------------------------------------------------------
+
+def cmd_verify_cook(args):
+    recipe_path = os.path.abspath(args.recipe)
+    video_path  = os.path.abspath(args.video)
+
+    if not os.path.exists(recipe_path):
+        die("Recipe file not found: {}".format(recipe_path))
+    if not os.path.exists(video_path):
+        die("Fan cooked video not found: {}".format(video_path))
+
+    recipe_meta = parse_recipe_minimal(recipe_path)
+    if not recipe_meta.get("signed"):
+        die("Recipe has not been signed yet. Run sign-recipe first.")
+    if not recipe_meta.get("cooked_phash_sequence"):
+        die("Recipe has no cooked_phash_sequence. Run fingerprint-cook first.")
+
+    recipe_dir      = os.path.dirname(recipe_path)
+    recipe_filename = os.path.basename(recipe_path)
+    video_filename  = os.path.basename(video_path)
+
+    output_path = os.path.abspath(args.output) if args.output else None
+    if output_path:
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        output_dir      = os.path.dirname(output_path)
+        output_filename = os.path.basename(output_path)
+    else:
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        output_dir      = os.path.join(project_root, "tmp")
+        output_filename = None
+
+    os.makedirs(output_dir, exist_ok=True)
+    ensure_image()
+
+    mounts = [
+        (recipe_dir, "/work/recipe", "ro"),
+        (video_path, "/work/video/{}".format(video_filename), "ro"),
+        (output_dir, "/work/out",    "rw"),
+        (SCRIPTS_DIR, "/scripts",   "ro"),
+    ]
+
+    verify_cmd = [
+        "python3", "/scripts/verify_cook.py",
+        "--recipe",      "/work/recipe/{}".format(recipe_filename),
+        "--video",       "/work/video/{}".format(video_filename),
+        "--sample-rate", str(args.sample_rate),
+    ]
+    if output_filename:
+        verify_cmd += ["--output", "/work/out/{}".format(output_filename)]
+
+    print("Verifying fan cooked output against recipe cooked_phash_sequence...")
+    print("  Recipe: {}".format(recipe_filename))
+    print("  Video:  {}".format(video_filename))
+    print()
+
+    result = run_docker(DOCKER_IMAGE, mounts, verify_cmd)
+    if result.returncode not in (0, 1):
+        die("verify-cook failed (exit {})".format(result.returncode))
+
+
+# ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
 
@@ -1407,6 +1520,31 @@ def main():
     p_verify.add_argument("--output", default=None, metavar="<report.csv>",
                           help="Path to write per-frame distance CSV (optional)")
     p_verify.set_defaults(func=cmd_verify_conform)
+
+    # fingerprint-cook
+    p_fp_cook = sub.add_parser(
+        "fingerprint-cook",
+        help="Fingerprint the author's cooked output and write cooked_phash_sequence into the recipe",
+    )
+    p_fp_cook.add_argument("recipe", metavar="<recipe.yaml>")
+    p_fp_cook.add_argument("video",  metavar="<cooked_video>",
+                           help="The author's rendered fan edit output")
+    p_fp_cook.add_argument("--force", action="store_true",
+                           help="Re-fingerprint even if cooked_phash_sequence already exists")
+    p_fp_cook.set_defaults(func=cmd_fingerprint_cook)
+
+    # verify-cook
+    p_verify_cook = sub.add_parser(
+        "verify-cook",
+        help="Compare a fan-rendered cooked output against the recipe cooked_phash_sequence",
+    )
+    p_verify_cook.add_argument("recipe", metavar="<recipe.yaml>")
+    p_verify_cook.add_argument("video",  metavar="<fan_cooked_video>")
+    p_verify_cook.add_argument("--sample-rate", type=int, default=1, metavar="<N>",
+                               help="Compare every Nth frame (default: 1). Use 24 for ~1fps sampling.")
+    p_verify_cook.add_argument("--output", default=None, metavar="<report.csv>",
+                               help="Path to write per-frame distance CSV (optional)")
+    p_verify_cook.set_defaults(func=cmd_verify_cook)
 
     # inspect (debug)
     p_inspect = sub.add_parser(

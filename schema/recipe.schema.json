@@ -80,6 +80,16 @@
       "type": "array",
       "description": "One entry per source slot defined in the .blend VSE timeline.",
       "items": { "$ref": "#/definitions/source" }
+    },
+    "cooked_phash_sequence": {
+      "type": "array",
+      "description": "Per-frame pHash sequence of the author's own cooked output, written by fingerprint-cook. Used by verify-cook to compare fan renders against the author's ground-truth output.",
+      "items": {
+        "type": "string",
+        "minLength": 16,
+        "maxLength": 16
+      },
+      "minItems": 1
     }
   },
   "definitions": {
