@@ -567,6 +567,12 @@ def _refine_break_boundary(viewer_path, author_ints, b, fps,
     starting at b["author_end_frame"] against the viewer at each candidate
     seek point.
 
+    A single ffmpeg extraction covers the full candidate window (lead +
+    probe + tail at native fps). Candidates are tested by sliding over the
+    cached integer array, mapping each half-frame step to the nearest native
+    frame. This replaces the previous per-candidate ffmpeg loop (O(breaks *
+    candidates) calls -> O(breaks) calls).
+
     Returns the refined viewer_end_tc (float, seconds).
     """
     author_end_fr = b["author_end_frame"]
@@ -575,25 +581,46 @@ def _refine_break_boundary(viewer_path, author_ints, b, fps,
     if n_probe == 0:
         return b["viewer_end_tc"]
 
-    base_tc = b["viewer_end_tc"]
-    half_step = 0.5 / fps  # half-frame increment
+    base_tc   = b["viewer_end_tc"]
+    half_step = 0.5 / fps
+
+    # One extraction covers: half_frame_steps native frames of lead + probe +
+    # half_frame_steps native frames of tail.
+    lead      = half_frame_steps
+    n_extract = lead + probe_frames + half_frame_steps
+    start_tc  = max(0.0, base_tc - lead / fps)
+    # Recompute actual lead after clamping (in case base_tc < lead/fps).
+    actual_lead = round((base_tc - start_tc) * fps)
+
+    all_hashes = extract_phashes_pipe(
+        viewer_path, start_tc, fps, n_frames=n_extract)
+
+    if not all_hashes:
+        print("  [DTW]   WARNING: break boundary refinement failed at {:.2f}s; "
+              "using DTW prediction.".format(b["author_start_tc"]), flush=True)
+        return base_tc
+
+    all_ints = [int(h, 16) for h in all_hashes]
 
     best_tc    = base_tc
     best_score = float("inf")
 
-    n_candidates = half_frame_steps * 2 * 2 + 1  # +-half_frame_steps frames in 0.5-fr steps
     for i in range(-(half_frame_steps * 2), half_frame_steps * 2 + 1):
-        candidate_tc = max(0.0, base_tc + i * half_step)
-        viewer_frames = extract_phashes_pipe(
-            viewer_path, candidate_tc, fps, n_frames=n_probe)
-        if len(viewer_frames) < n_probe:
+        # Map half-frame step i to the nearest native frame in the extracted window.
+        native_offset = round(i / 2.0)
+        start_idx = actual_lead + native_offset
+        if start_idx < 0 or start_idx + n_probe > len(all_ints):
             continue
-        viewer_ints_c = [int(h, 16) for h in viewer_frames]
-        total = sum(_hamming(probe_ints[j], viewer_ints_c[j]) for j in range(n_probe))
+        candidate_ints = all_ints[start_idx:start_idx + n_probe]
+        total = sum(_hamming(probe_ints[j], candidate_ints[j]) for j in range(n_probe))
         score = total / n_probe
         if score < best_score:
             best_score = score
-            best_tc    = candidate_tc
+            best_tc    = max(0.0, base_tc + i * half_step)
+
+    if best_score == float("inf"):
+        print("  [DTW]   WARNING: break boundary refinement failed at {:.2f}s; "
+              "using DTW prediction.".format(b["author_start_tc"]), flush=True)
 
     return best_tc
 

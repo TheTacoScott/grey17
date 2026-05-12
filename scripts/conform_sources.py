@@ -167,7 +167,13 @@ def _simple_conform(source, input_file, work_dir):
         print("  ERROR: output file not created", file=sys.stderr)
         return False
 
-    print("  Written: {:.1f}MB".format(os.path.getsize(output_path) / 1e6), flush=True)
+    size_mb = os.path.getsize(output_path) / 1e6
+    if size_mb < 1.0:
+        print("  ERROR: output file is suspiciously small ({:.1f}MB); "
+              "ffmpeg may have failed silently".format(size_mb), file=sys.stderr)
+        return False
+
+    print("  Written: {:.1f}MB".format(size_mb), flush=True)
     return True
 
 
@@ -363,8 +369,13 @@ def _segmented_conform(source, input_file, work_dir):
         print("  ERROR: output file not created", file=sys.stderr)
         return False
 
-    print("  Written: {:.1f}MB  ({})".format(
-        os.path.getsize(output_path) / 1e6, output_path), flush=True)
+    size_mb = os.path.getsize(output_path) / 1e6
+    if size_mb < 1.0:
+        print("  ERROR: output file is suspiciously small ({:.1f}MB); "
+              "ffmpeg may have failed silently".format(size_mb), file=sys.stderr)
+        return False
+
+    print("  Written: {:.1f}MB  ({})".format(size_mb, output_path), flush=True)
     return True
 
 

@@ -200,8 +200,10 @@ def run_fpcalc(path, offset_secs, duration_secs):
             tmp_path,
             "-y", "-hide_banner", "-loglevel", "error",
         ]
-        r = subprocess.run(extract_cmd)
+        r = subprocess.run(extract_cmd, capture_output=True, text=True)
         if r.returncode != 0:
+            print("WARNING: ffmpeg audio extract failed for {}: {}".format(
+                os.path.basename(path), r.stderr[:300]), file=sys.stderr)
             return []
 
         # fpcalc default max is 120s; pass the actual duration to fingerprint everything
