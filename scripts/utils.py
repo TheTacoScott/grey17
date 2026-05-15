@@ -170,66 +170,6 @@ def extract_phashes_pipe(video_path, start_tc, fps, crop=None, n_frames=None, pr
 
 
 # ---------------------------------------------------------------------------
-# Chromaprint audio fingerprint
-# ---------------------------------------------------------------------------
-
-def run_fpcalc(path, offset_secs, duration_secs):
-    """
-    Extract a raw Chromaprint fingerprint for an audio window.
-    Uses ffmpeg to seek and extract the audio window to a temp FLAC file, then
-    runs fpcalc on that file. This approach works with older fpcalc versions that
-    do not support the -offset flag.
-
-    offset_secs: skip this many seconds from the start of the file.
-    duration_secs: extract this many seconds of audio.
-    Returns a list of 32-bit integers (Chromaprint values), or [] on failure.
-    """
-    import tempfile
-
-    with tempfile.NamedTemporaryFile(suffix=".flac", delete=False) as tmp:
-        tmp_path = tmp.name
-
-    try:
-        # Extract audio window to a temporary FLAC file
-        extract_cmd = [
-            "ffmpeg",
-            "-ss", "{:.6f}".format(offset_secs),
-            "-i", path,
-            "-t", "{:.6f}".format(duration_secs),
-            "-vn",
-            tmp_path,
-            "-y", "-hide_banner", "-loglevel", "error",
-        ]
-        r = subprocess.run(extract_cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            print("WARNING: ffmpeg audio extract failed for {}: {}".format(
-                os.path.basename(path), r.stderr[:300]), file=sys.stderr)
-            return []
-
-        # fpcalc default max is 120s; pass the actual duration to fingerprint everything
-        fpcalc_cmd = [
-            "fpcalc",
-            "-json", "-raw",
-            "-length", "{:.1f}".format(duration_secs + 5),
-            tmp_path,
-        ]
-        result = subprocess.run(fpcalc_cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print("WARNING: fpcalc failed for {}: {}".format(
-                os.path.basename(path), result.stderr[:300]), file=sys.stderr)
-            return []
-        try:
-            data = json.loads(result.stdout)
-            return data.get("fingerprint", [])
-        except (json.JSONDecodeError, ValueError) as exc:
-            print("WARNING: fpcalc JSON parse error: {}".format(exc), file=sys.stderr)
-            return []
-    finally:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-
-
-# ---------------------------------------------------------------------------
 # Crop detection
 # ---------------------------------------------------------------------------
 

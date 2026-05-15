@@ -7,9 +7,6 @@ Signing produces:
   phash_sequence  - concatenated 16-char hex pHash strings for every frame of
                     the source, at native fps. One string covering the entire
                     video. Length = num_frames * 16 characters.
-  audio_start_fp  - raw Chromaprint integers for the first AUDIO_WINDOW_SECS
-                    of audio (list of ints).
-  audio_end_fp    - raw Chromaprint integers for the last AUDIO_WINDOW_SECS.
 
 Usage:
     python3 sign_recipe.py \
@@ -18,20 +15,11 @@ Usage:
 """
 import argparse
 import os
-import shutil
-import subprocess
 import sys
 
 import yaml
 
-from utils import compute_sha256, ffprobe_source, detect_crop, extract_phashes_pipe, run_fpcalc
-
-# ---------------------------------------------------------------------------
-# Audio fingerprint constants
-# ---------------------------------------------------------------------------
-
-# Seconds of audio to capture at each end of the source.
-AUDIO_WINDOW_SECS = 300.0
+from utils import compute_sha256, ffprobe_source, detect_crop, extract_phashes_pipe
 
 # ---------------------------------------------------------------------------
 # Args
@@ -39,12 +27,10 @@ AUDIO_WINDOW_SECS = 300.0
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Fingerprint source videos and write anchor data into a recipe.",
+        description="Fingerprint source videos and write pHash sequence into a recipe.",
         epilog=(
-            "Hashes every frame of each source at native fps (phash_sequence) and "
-            "captures Chromaprint audio fingerprints for the first and last "
-            "{:.0f}s. These are used by 'grey17 match' for sliding window "
-            "endpoint alignment.".format(AUDIO_WINDOW_SECS)
+            "Hashes every frame of each source at native fps (phash_sequence). "
+            "These are used by 'grey17 match' for full-frame DTW alignment."
         ),
     )
     p.add_argument("--recipe", required=True, help="Path to recipe.yaml (read/write)")
@@ -72,13 +58,10 @@ def parse_source_args(source_args):
 def sign_source(source, source_path):
     """
     Sign a single source file.
-    Returns (meta, phash_sequence, audio_start_fp, audio_end_fp).
+    Returns (meta, phash_sequence).
 
     phash_sequence is a list of 16-char hex pHash strings, one per frame.
-    audio_start_fp and audio_end_fp are lists of Chromaprint ints.
     """
-    source_id = source["id"]
-
     print("  Computing SHA256...", flush=True)
     sha256 = compute_sha256(source_path)
     print("  SHA256: {}".format(sha256), flush=True)
@@ -127,28 +110,7 @@ def sign_source(source, source_path):
     phash_sequence = hashes  # list of 16-char hex pHash strings, one per frame
     print("  pHash complete: {} frames".format(len(phash_sequence)), flush=True)
 
-    # Audio fingerprints
-    print("  Extracting audio fingerprint (start {:.0f}s)...".format(
-        AUDIO_WINDOW_SECS), flush=True)
-    audio_start_fp = run_fpcalc(source_path, 0.0, AUDIO_WINDOW_SECS)
-    if audio_start_fp:
-        print("  audio_start_fp: {} ints ({:.1f}s)".format(
-            len(audio_start_fp), len(audio_start_fp) / 86.0), flush=True)
-    else:
-        print("  WARNING: audio_start_fp extraction failed (fpcalc missing or audio absent?)",
-              flush=True)
-
-    end_audio_offset = max(0.0, duration - AUDIO_WINDOW_SECS)
-    print("  Extracting audio fingerprint (end {:.0f}s from {:.1f}s)...".format(
-        AUDIO_WINDOW_SECS, end_audio_offset), flush=True)
-    audio_end_fp = run_fpcalc(source_path, end_audio_offset, AUDIO_WINDOW_SECS)
-    if audio_end_fp:
-        print("  audio_end_fp: {} ints ({:.1f}s)".format(
-            len(audio_end_fp), len(audio_end_fp) / 86.0), flush=True)
-    else:
-        print("  WARNING: audio_end_fp extraction failed", flush=True)
-
-    return meta, phash_sequence, audio_start_fp, audio_end_fp
+    return meta, phash_sequence
 
 # ---------------------------------------------------------------------------
 # Main
@@ -173,7 +135,7 @@ def main():
 
         print("\nSigning {} ({})".format(slot_id, os.path.basename(source_path)), flush=True)
         try:
-            meta, phash_sequence, audio_start_fp, audio_end_fp = sign_source(source, source_path)
+            meta, phash_sequence = sign_source(source, source_path)
         except Exception as e:
             print("ERROR signing {}: {}".format(slot_id, e), file=sys.stderr)
             continue
@@ -195,22 +157,14 @@ def main():
         orig["audio_sample_rate"] = meta["audio_sample_rate"]
 
         source["phash_sequence"] = phash_sequence
-        if audio_start_fp:
-            source["audio_start_fp"] = audio_start_fp
-        if audio_end_fp:
-            source["audio_end_fp"] = audio_end_fp
-        source.pop("breaks", None)
 
-        # Remove fields from previous sign format
-        for key in ("anchors", "start_anchors", "end_anchors",
-                    "start_sequence", "end_sequence", "strip_timecodes"):
+        # Remove fields from previous sign formats
+        for key in ("audio_start_fp", "audio_end_fp", "anchors",
+                    "start_anchors", "end_anchors", "start_sequence",
+                    "end_sequence", "strip_timecodes", "breaks"):
             source.pop(key, None)
 
-        print("  Done: {} frames, {} audio start ints, {} audio end ints".format(
-            len(phash_sequence),
-            len(audio_start_fp) if audio_start_fp else 0,
-            len(audio_end_fp) if audio_end_fp else 0,
-        ), flush=True)
+        print("  Done: {} frames".format(len(phash_sequence)), flush=True)
 
     recipe["signed"] = True
 

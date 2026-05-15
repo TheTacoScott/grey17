@@ -106,23 +106,13 @@
         "original":          { "$ref": "#/definitions/original" },
         "phash_sequence": {
           "type": "array",
-          "description": "Dense pHash sequence for every frame of the source at native fps. phash_sequence[i] is a 16-char hex pHash string for frame i. Split at midpoint for start/end endpoint matching.",
+          "description": "Dense pHash sequence for every frame of the source at native fps. phash_sequence[i] is a 16-char hex pHash string for frame i.",
           "items": {
             "type": "string",
             "minLength": 16,
             "maxLength": 16
           },
           "minItems": 1
-        },
-        "audio_start_fp": {
-          "type": "array",
-          "description": "Raw Chromaprint fingerprint integers for the first portion of audio. Each integer is a 32-bit Chromaprint value.",
-          "items": { "type": "integer" }
-        },
-        "audio_end_fp": {
-          "type": "array",
-          "description": "Raw Chromaprint fingerprint integers for the last portion of audio.",
-          "items": { "type": "integer" }
         }
       }
     },
@@ -161,6 +151,6 @@
         "x": { "type": "integer" },
         "y": { "type": "integer" }
       }
-    },
+    }
   }
 }

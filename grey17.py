@@ -211,7 +211,7 @@ def manifest_to_recipe(manifest, blend_path, title, author, blend_dir_host=None)
                 "audio_channels": None,
                 "audio_sample_rate": None,
             },
-            # phash_sequence and audio fingerprints populated by sign-recipe
+            # phash_sequence populated by sign-recipe
         })
 
     recipe = {
@@ -1443,7 +1443,7 @@ def main():
     # sign-recipe
     p_sign = sub.add_parser(
         "sign-recipe",
-        help="Fingerprint source videos and write pHash sequence and audio fingerprints into a recipe",
+        help="Fingerprint source videos and write pHash sequence into a recipe",
     )
     p_sign.add_argument("recipe", metavar="<recipe.yaml>")
     p_sign.add_argument("--source", action="append", default=[],
