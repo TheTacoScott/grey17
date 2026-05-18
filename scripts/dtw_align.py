@@ -43,7 +43,7 @@ import os
 import struct
 import tempfile
 import time
-from utils import extract_phashes_pipe
+from utils import extract_phashes_pipe  # used for viewer extraction only
 
 # bisect is stdlib - used in _map_breaks_via_path
 import bisect
@@ -575,23 +575,15 @@ def _hamming(a, b):
             _PC[(x >> 32) & 0xFFFF] + _PC[(x >> 48) & 0xFFFF])
 
 
-def _refine_break_boundary(viewer_path, author_ints, b, fps,
-                            probe_frames=60, half_frame_steps=4):
+def _refine_break_boundary(author_ints, viewer_ints, b, fps,
+                            probe_frames=60, search_frames=4):
     """
-    Refine viewer_end_tc for a single non-zero-delta break by testing
-    sub-frame candidate positions around the DTW prediction.
+    Refine viewer_end_tc for a single non-zero-delta break.
 
-    The DTW path gives viewer_end_tc accurate to +-1 frame (the median
-    deviation is rounded to the nearest integer frame). This function
-    tests positions at half-frame increments across a window of
-    +-half_frame_steps frames, comparing probe_frames of author source
-    content starting at b["author_end_frame"] against the viewer at each
-    candidate seek point.
-
-    A single ffmpeg extraction covers the full candidate window (lead +
-    probe + tail at native fps). Candidates are tested by sliding over the
-    cached integer array, mapping each half-frame step to the nearest native
-    frame.
+    The DTW path deviation gives viewer_end_tc accurate to +-1 frame.
+    This function searches +-search_frames around the DTW prediction,
+    comparing probe_frames of author source content against the viewer
+    hashes already in memory (no additional ffmpeg call).
 
     Returns the refined viewer_end_tc (float, seconds).
     """
@@ -601,48 +593,28 @@ def _refine_break_boundary(viewer_path, author_ints, b, fps,
     if n_probe == 0:
         return b["viewer_end_tc"]
 
-    base_tc   = b["viewer_end_tc"]
-    half_step = 0.5 / fps
+    base_frame = round(b["viewer_end_tc"] * fps)
 
-    # One extraction covers: half_frame_steps native frames of lead + probe +
-    # half_frame_steps native frames of tail.
-    lead      = half_frame_steps
-    n_extract = lead + probe_frames + half_frame_steps
-    start_tc  = max(0.0, base_tc - lead / fps)
-    # Recompute actual lead after clamping (in case base_tc < lead/fps).
-    actual_lead = round((base_tc - start_tc) * fps)
+    best_offset = 0
+    best_score  = float("inf")
 
-    all_hashes = extract_phashes_pipe(
-        viewer_path, start_tc, fps, n_frames=n_extract)
-
-    if not all_hashes:
-        print("  [DTW]   WARNING: break boundary refinement failed at {:.2f}s; "
-              "using DTW prediction.".format(b["author_start_tc"]), flush=True)
-        return base_tc
-
-    all_ints = [int(h, 16) for h in all_hashes]
-
-    best_tc    = base_tc
-    best_score = float("inf")
-
-    for i in range(-(half_frame_steps * 2), half_frame_steps * 2 + 1):
-        # Map half-frame step i to the nearest native frame in the extracted window.
-        native_offset = round(i / 2.0)
-        start_idx = actual_lead + native_offset
-        if start_idx < 0 or start_idx + n_probe > len(all_ints):
+    for offset in range(-search_frames, search_frames + 1):
+        start_idx = base_frame + offset
+        if start_idx < 0 or start_idx + n_probe > len(viewer_ints):
             continue
-        candidate_ints = all_ints[start_idx:start_idx + n_probe]
-        total = sum(_hamming(probe_ints[j], candidate_ints[j]) for j in range(n_probe))
+        total = sum(_hamming(probe_ints[j], viewer_ints[start_idx + j])
+                    for j in range(n_probe))
         score = total / n_probe
         if score < best_score:
-            best_score = score
-            best_tc    = max(0.0, base_tc + i * half_step)
+            best_score  = score
+            best_offset = offset
 
     if best_score == float("inf"):
         print("  [DTW]   WARNING: break boundary refinement failed at {:.2f}s; "
               "using DTW prediction.".format(b["author_start_tc"]), flush=True)
+        return b["viewer_end_tc"]
 
-    return best_tc
+    return max(0.0, (base_frame + best_offset) / fps)
 
 
 # ---------------------------------------------------------------------------
@@ -853,14 +825,13 @@ def run_dtw(author_hashes, viewer_path, fps,
     author_breaks_raw = detect_black_segments(author_hashes, fps)
     author_breaks = _map_breaks_via_path(author_breaks_raw, path, fps)
 
-    # Sub-frame refinement: for each non-zero-delta break, test half-frame
-    # candidate TCs around the DTW prediction to pin the exact seek point
-    # where viewer content resumes after the break.
+    # Refinement: for each non-zero-delta break, search +-4 frames around the
+    # DTW prediction using the already-extracted viewer_ints (no extra ffmpeg).
     for b in author_breaks:
         if b["frame_delta"] == 0:
             continue
         old_tc = b["viewer_end_tc"]
-        refined_tc = _refine_break_boundary(viewer_path, author_ints, b, fps)
+        refined_tc = _refine_break_boundary(author_ints, viewer_ints, b, fps)
         b["viewer_end_tc"] = refined_tc
         shift_fr = (refined_tc - old_tc) * fps
         print("  [DTW]   refine break @{:.2f}s: viewer_end_tc {:.6f}s -> {:.6f}s "
