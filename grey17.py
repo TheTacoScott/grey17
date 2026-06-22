@@ -205,7 +205,6 @@ def manifest_to_recipe(manifest, blend_path, title, author, blend_dir_host=None)
                 "resolution_y": None,
                 "fps": None,
                 "duration_seconds": None,
-                "duration_frames": None,
                 "video_codec": None,
                 "audio_codec": None,
                 "audio_channels": None,

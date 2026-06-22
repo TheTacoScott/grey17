@@ -5,8 +5,6 @@ Imported by sign_recipe.py and match_recipe.py.
 """
 import hashlib
 import json
-import os
-import re
 import subprocess
 import sys
 
@@ -100,18 +98,6 @@ def phash_distance(h1, h2):
     except ValueError:
         return 64
 
-
-def hash_frame(png_path):
-    """
-    Compute perceptual hash for a 32x32 grayscale PNG.
-    Returns phash_str, or "0"*16 on failure.
-    """
-    try:
-        img = Image.open(png_path).convert("L")
-        return str(imagehash.phash(img))
-    except Exception as e:
-        print("WARNING: hash failed for {}: {}".format(png_path, e), file=sys.stderr)
-        return "0" * 16
 
 # ---------------------------------------------------------------------------
 # Pipe-based frame extraction

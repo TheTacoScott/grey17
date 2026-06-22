@@ -129,7 +129,6 @@
         "resolution_y":               { "type": ["integer", "null"] },
         "fps":                        { "type": ["number", "null"] },
         "duration_seconds":           { "type": ["number", "null"] },
-        "duration_frames":            { "type": ["integer", "null"] },
         "video_codec":                { "type": ["string", "null"] },
         "audio_codec":                { "type": ["string", "null"] },
         "audio_channels":             { "type": ["integer", "null"] },

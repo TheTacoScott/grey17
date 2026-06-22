@@ -60,14 +60,12 @@ _PC_NP = np.array(_PC, dtype=np.int32)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _pred_j(i, viewer_fps, fps, m):
+def _pred_j(i, m):
     """
     Predicted viewer frame index for author frame i.
-    Band is always centered on the diagonal (speed=1.0, offset=0.0).
-    viewer_frame = int(i * viewer_fps / fps)
+    Band is centered on the diagonal (speed=1.0, offset=0.0), so viewer_frame = i.
     """
-    j = int(i * viewer_fps / fps)
-    return max(0, min(m - 1, j))
+    return max(0, min(m - 1, i))
 
 
 def _lsq_offset(path, fps):
@@ -388,7 +386,7 @@ def _np_hamming_band(ai, viewer_arr, j_lo, j_hi):
     return costs
 
 
-def _forward_pass(author_ints, viewer_ints, fps, viewer_fps, band, store):
+def _forward_pass(author_ints, viewer_ints, fps, band, store):
     """
     Fill the DTW DP table row by row.
 
@@ -411,7 +409,7 @@ def _forward_pass(author_ints, viewer_ints, fps, viewer_fps, band, store):
     # ------------------------------------------------------------------
     # Row 0: seed with cumulative left costs.
     # ------------------------------------------------------------------
-    jc0 = _pred_j(0, viewer_fps, fps, m)
+    jc0 = _pred_j(0, m)
     j_lo_0 = max(0, jc0 - band)
     j_hi_0 = min(m - 1, jc0 + band)
     width_0 = j_hi_0 - j_lo_0 + 1
@@ -435,7 +433,7 @@ def _forward_pass(author_ints, viewer_ints, fps, viewer_fps, band, store):
     # Numpy vectorizes the cost computation; left-scan is sequential.
     # ------------------------------------------------------------------
     for i in range(1, n):
-        jc = _pred_j(i, viewer_fps, fps, m)
+        jc = _pred_j(i, m)
         j_lo = max(0, jc - band)
         j_hi = min(m - 1, jc + band)
         width = j_hi - j_lo + 1
@@ -487,7 +485,7 @@ def _forward_pass(author_ints, viewer_ints, fps, viewer_fps, band, store):
 # Traceback
 # ---------------------------------------------------------------------------
 
-def _traceback(n, m, final_row, fps, viewer_fps, band, store):
+def _traceback(n, m, final_row, fps, band, store):
     """
     Trace the minimum-cost path from the best endpoint in the final row back
     to (0, 0). Releases stripes from RAM as traceback moves to older rows.
@@ -497,7 +495,7 @@ def _traceback(n, m, final_row, fps, viewer_fps, band, store):
     sh = store._sh
 
     # Best endpoint: minimum cost within band on final row
-    jc = _pred_j(n - 1, viewer_fps, fps, m)
+    jc = _pred_j(n - 1, m)
     j_lo_last = max(0, jc - band)
     j_hi_last = min(m - 1, jc + band)
     best_j, best_cost = j_lo_last, INF
@@ -727,23 +725,22 @@ def _compute_segment_transforms(path, author_breaks, fps, n_author):
 # ---------------------------------------------------------------------------
 
 def run_dtw(author_hashes, viewer_path, fps,
-            crop=None, band_frames=10000, sub_frame_factor=1,
+            crop=None, band_frames=10000,
             stripe_height=2000, max_mem_mb=256, tmp_dir=None):
     """
     Full-frame DTW alignment. No downsampling. Band centered on diagonal.
 
-    author_hashes:    full per-frame pHash list from recipe phash_sequence
-    viewer_path:      path to viewer video file (inside Docker)
-    fps:              author native fps; viewer is also extracted at this rate
-    crop:             optional {w,h,x,y} dict applied before hashing
-    band_frames:      Sakoe-Chiba half-band in ORIGINAL frame units.
-                      Default 10000 (~417s at 24fps) covers any realistic
-                      commercial break length difference.
-    sub_frame_factor: extract viewer at fps*N (default 1 = native fps).
-    stripe_height:    rows per backpointer stripe. Higher values reduce disk
-                      seeks at the cost of larger individual stripes.
-    max_mem_mb:       RAM budget for in-memory stripes before disk spill.
-    tmp_dir:          directory for backpointer spill files (default: system tmp).
+    author_hashes:  full per-frame pHash list from recipe phash_sequence
+    viewer_path:    path to viewer video file (inside Docker)
+    fps:            author native fps; viewer is also extracted at this rate
+    crop:           optional {w,h,x,y} dict applied before hashing
+    band_frames:    Sakoe-Chiba half-band in frame units.
+                    Default 10000 (~417s at 24fps) covers any realistic
+                    commercial break length difference.
+    stripe_height:  rows per backpointer stripe. Higher values reduce disk
+                    seeks at the cost of larger individual stripes.
+    max_mem_mb:     RAM budget for in-memory stripes before disk spill.
+    tmp_dir:        directory for backpointer spill files (default: system tmp).
 
     Returns dict with keys:
         diag_offset    -- mean (viewer_tc - author_tc) over path (diagnostic only)
@@ -763,10 +760,9 @@ def run_dtw(author_hashes, viewer_path, fps,
 
     author_ints = [int(h, 16) for h in author_hashes]
 
-    viewer_fps = fps * sub_frame_factor
-    print("  [DTW] extracting viewer at {:.4f}fps...".format(viewer_fps), flush=True)
+    print("  [DTW] extracting viewer at {:.4f}fps...".format(fps), flush=True)
     viewer_hashes = extract_phashes_pipe(
-        viewer_path, 0.0, viewer_fps, crop=crop,
+        viewer_path, 0.0, fps, crop=crop,
         progress_callback=lambda c: print(
             "  [DTW] ... {} viewer frames".format(c), flush=True),
     )
@@ -776,7 +772,7 @@ def run_dtw(author_hashes, viewer_path, fps,
         return None
 
     viewer_ints = [int(h, 16) for h in viewer_hashes]
-    band = band_frames * sub_frame_factor
+    band = band_frames
 
     # Estimate memory and disk requirements
     n_stripes = (n + stripe_height - 1) // stripe_height
@@ -795,10 +791,10 @@ def run_dtw(author_hashes, viewer_path, fps,
     store = _StripeStore(stripe_height, max_mem_stripes, tmp_dir=tmp_dir)
     try:
         final_row = _forward_pass(
-            author_ints, viewer_ints, fps, viewer_fps, band, store)
+            author_ints, viewer_ints, fps, band, store)
         print("  [DTW] forward pass complete, tracing back...", flush=True)
         path = _traceback(
-            n, m, final_row, fps, viewer_fps, band, store)
+            n, m, final_row, fps, band, store)
     finally:
         store.cleanup()
 
